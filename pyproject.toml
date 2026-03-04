@@ -1,0 +1,47 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kinescope"
+version = "0.1.0"
+description = "Predict clinical and sports scores from human movement video using kinematics"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = [
+    "pandas>=1.5",
+    "numpy>=1.23",
+    "scipy>=1.9",
+    "matplotlib>=3.6",
+    "tqdm",
+    "scikit-learn>=1.2",
+    "xgboost>=1.7",
+    "opencv-python",
+    "moviepy",
+    "scikit-video",
+]
+
+[project.optional-dependencies]
+vit = [
+    "torch>=2.0",
+    "einops",
+]
+dev = [
+    "jupyter",
+    "ipykernel",
+    "pytest",
+]
+
+[project.scripts]
+kinescope = "kinescope.cli:main"
+
+[project.urls]
+Repository = "https://github.com/quietscientist/score_prediction_from_video"
+Paper = "https://doi.org/10.5281/zenodo.14042732"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kinescope"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/", "README.md", "LICENSE"]
