@@ -46,6 +46,25 @@ def _cmd_convert(args):
     print(f"Converted {len(df)} keypoint rows → {args.output}")
 
 
+def _cmd_pretrain(args):
+    from kinescope.pretrain.pretrain import pretrain
+    pretrain(
+        output_dir=args.output,
+        datasets=args.datasets if args.datasets else None,
+        data_dir=args.data_dir,
+        data_root=args.data_root,
+        epochs=args.epochs,
+        embed_dim=args.embed_dim,
+        n_layers=args.n_layers,
+        n_heads=args.n_heads,
+        seq_len=args.seq_len,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        artifacts_dir=args.artifacts_dir,
+        device=args.device,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="kinescope",
@@ -85,6 +104,32 @@ def main():
     p_conv.add_argument("--output",  required=True, help="Output COCO-17 CSV path")
     p_conv.add_argument("--fps",     type=float, default=None, help="Frames per second (optional)")
     p_conv.set_defaults(func=_cmd_convert)
+
+    # ── pretrain ─────────────────────────────────────────────────────────────
+    p_pt = sub.add_parser("pretrain", help="Pretrain Pose-JEPA ViT on COCO-17 pose data")
+    p_pt.add_argument("--datasets",      nargs="+", metavar="DATASET",
+                      choices=["amass", "ntu120", "humoto", "coco"],
+                      help="Named datasets to load from $KINESCOPE_DATA_DIR "
+                           "(amass, ntu120, humoto, coco). Mutually exclusive with --data-dir.")
+    p_pt.add_argument("--data-dir",      dest="data_dir", default=None,
+                      help="Explicit directory of COCO-17 CSV files or .npy clip arrays. "
+                           "Use instead of --datasets for custom data.")
+    p_pt.add_argument("--data-root",     dest="data_root", default=None,
+                      help="Override $KINESCOPE_DATA_DIR for --datasets loading.")
+    p_pt.add_argument("--output",        required=True, help="Output directory (checkpoints + metrics)")
+    p_pt.add_argument("--epochs",        type=int,   default=100)
+    p_pt.add_argument("--embed-dim",     type=int,   default=128,  dest="embed_dim")
+    p_pt.add_argument("--n-layers",      type=int,   default=4,    dest="n_layers")
+    p_pt.add_argument("--n-heads",       type=int,   default=4,    dest="n_heads")
+    p_pt.add_argument("--seq-len",       type=int,   default=60,   dest="seq_len",
+                      help="Frames per clip (must match data)")
+    p_pt.add_argument("--batch-size",    type=int,   default=64,   dest="batch_size")
+    p_pt.add_argument("--lr",            type=float, default=1e-4)
+    p_pt.add_argument("--artifacts-dir", default="artifacts",     dest="artifacts_dir",
+                      help="Directory for diagnostic visualizations (default: artifacts/)")
+    p_pt.add_argument("--device",        default="auto",
+                      choices=["auto", "cpu", "cuda", "mps"])
+    p_pt.set_defaults(func=_cmd_pretrain)
 
     parsed = parser.parse_args()
     parsed.func(parsed)
