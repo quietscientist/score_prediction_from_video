@@ -32,8 +32,8 @@ git clone https://github.com/quietscientist/score_prediction_from_video
 cd score_prediction_from_video
 
 # Create venv
-uv venv /home/msegado/score_prediction_from_video/.venv
-source /home/msegado/score_prediction_from_video/.venv/bin/activate
+uv venv .venv
+source .venv/bin/activate
 
 uv pip install -e .
 

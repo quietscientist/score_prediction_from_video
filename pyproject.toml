@@ -27,6 +27,13 @@ vit = [
     "torch>=2.0",
     "einops",
 ]
+pretrain = [
+    "torch>=2.0",
+    "einops",
+    "smplx",      # SMPL joint regressor for AMASS → COCO-17 conversion
+    "pygltflib",  # GLB/GLTF reading for HUMOTO (pure Python, no system deps)
+    "pyyaml",     # HUMOTO YAML sidecar parsing
+]
 dev = [
     "jupyter",
     "ipykernel",
