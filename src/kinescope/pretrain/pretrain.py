@@ -106,6 +106,14 @@ def pretrain(
     lr: float = 1e-4,
     artifacts_dir: Optional[str] = None,
     device: str = "auto",
+    checkpoint_every: int = 10,
+    mlflow_experiment: str = "pose-jepa-pretrain",
+    use_amp: bool = True,
+    max_clips: Optional[int] = None,
+    tpc_weight: float = 0.0,
+    invariant_weight: float = 0.0,
+    long_horizon_weight: float = 0.0,
+    long_horizon_segments: int = 4,
 ) -> dict:
     """
     Run Pose-JEPA pretraining.
@@ -142,6 +150,7 @@ def pretrain(
         dev = torch.device(device)
 
     print(f"Device: {dev}")
+    _ = mlflow_experiment, use_amp  # kept for CLI compatibility
 
     # Load clips
     if datasets is not None:
@@ -151,7 +160,7 @@ def pretrain(
         data_dir = pathlib.Path(data_dir)
         npy_files = sorted(data_dir.glob("*.npy"))
         if npy_files:
-            clips = np.concatenate([np.load(f) for f in npy_files], axis=0)
+            clips = np.concatenate([np.load(f, mmap_mode="r") for f in npy_files], axis=0)
             print(f"Loaded {len(clips)} clips from {len(npy_files)} .npy files")
         else:
             print(f"Loading COCO-17 CSV files from {data_dir} ...")
@@ -161,7 +170,14 @@ def pretrain(
         raise ValueError("Provide either datasets=['amass', ...] or data_dir='path/to/csvs'")
 
     if len(clips) == 0:
-        raise ValueError(f"No clips found in {data_dir}. Supply .csv or .npy files.")
+        source_desc = str(data_dir) if data_dir is not None else f"datasets={datasets}"
+        raise ValueError(f"No clips found from {source_desc}. Supply .csv or .npy files.")
+
+    if max_clips is not None and len(clips) > max_clips:
+        rng = np.random.default_rng(0)
+        idx = rng.choice(len(clips), size=max_clips, replace=False)
+        clips = np.asarray(clips[idx], dtype=np.float32)
+        print(f"Subsampled to {len(clips)} clips (--max-clips)")
 
     # Motion-aware sampling
     motion_weights = ClipDataset.compute_motion_weights(clips)
@@ -170,7 +186,7 @@ def pretrain(
         torch.tensor(motion_weights), num_samples=len(dataset), replacement=True
     )
     loader = DataLoader(
-        dataset, batch_size=batch_size, sampler=sampler, num_workers=2, pin_memory=True
+        dataset, batch_size=batch_size, sampler=sampler, num_workers=0, pin_memory=(dev.type == "cuda")
     )
 
     # Build Pose-JEPA model
@@ -181,11 +197,18 @@ def pretrain(
         n_heads=n_heads,
         seq_len=seq_len,
         coord_dim=coord_dim,
+        tpc_weight=tpc_weight,
+        invariant_weight=invariant_weight,
+        long_horizon_weight=long_horizon_weight,
+        long_horizon_segments=long_horizon_segments,
     ).to(dev)
 
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    # eta_min=5% of peak LR prevents the optimizer from becoming ineffective late in training
+    # while the EMA target encoder is still drifting. V-JEPA uses a cosine LR schedule
+    # with a non-zero floor (Bardes et al., ICLR 2024, Appendix A).
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=lr * 0.05)
 
     # Visualize input data before training
     if artifacts_dir:
@@ -212,11 +235,14 @@ def pretrain(
 
     jepa_losses = []
     tpc_losses = []
+    invariant_losses = []
+    long_horizon_losses = []
+    total_losses = []
     best_loss = float("inf")
 
     for epoch in range(1, epochs + 1):
         model.train()
-        epoch_jepa, epoch_tpc = [], []
+        epoch_jepa, epoch_tpc, epoch_inv, epoch_lh, epoch_total, epoch_grads = [], [], [], [], [], []
         t0 = time.time()
 
         for batch in loader:
@@ -225,40 +251,67 @@ def pretrain(
 
             optimizer.zero_grad()
             out["total_loss"].backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0).item()
             optimizer.step()
             model.update_ema()
 
             epoch_jepa.append(out["jepa_loss"].item())
             epoch_tpc.append(out["tpc_loss"].item())
+            epoch_inv.append(out["invariant_loss"].item())
+            epoch_lh.append(out["long_horizon_loss"].item())
+            epoch_total.append(out["total_loss"].item())
+            epoch_grads.append(grad_norm)
 
         scheduler.step()
+        model.step_ema_decay(epoch, epochs)
 
         mean_jepa = float(np.mean(epoch_jepa))
         mean_tpc = float(np.mean(epoch_tpc))
+        mean_inv = float(np.mean(epoch_inv))
+        mean_lh = float(np.mean(epoch_lh))
+        mean_total = float(np.mean(epoch_total))
+        mean_grad = float(np.mean(epoch_grads))
+        current_lr = scheduler.get_last_lr()[0]
         jepa_losses.append(mean_jepa)
         tpc_losses.append(mean_tpc)
+        invariant_losses.append(mean_inv)
+        long_horizon_losses.append(mean_lh)
+        total_losses.append(mean_total)
 
+        tpc_active = out["tpc_active_fraction"].item()
         print(
             f"Epoch {epoch:4d}/{epochs} | JEPA={mean_jepa:.4f} | TPC={mean_tpc:.4f}"
-            f" | t={time.time() - t0:.1f}s"
+            f" | TPC_active={tpc_active:.2f} | grad={mean_grad:.3f} | lr={current_lr:.2e}"
+            f" | ema_τ={model.current_ema_decay:.4f} | t={time.time() - t0:.1f}s"
         )
 
-        total = mean_jepa + 0.5 * mean_tpc
-        if total < best_loss:
-            best_loss = total
+        if epoch % checkpoint_every == 0:
+            torch.save(
+                {"epoch": epoch, "context_encoder": model.context_encoder.state_dict()},
+                output_dir / f"checkpoint_ep{epoch:04d}.pt",
+            )
+            print(f"  → Checkpoint saved: checkpoint_ep{epoch:04d}.pt")
+
+        if mean_total < best_loss:
+            best_loss = mean_total
             torch.save(
                 {
                     "epoch": epoch,
                     "context_encoder": model.context_encoder.state_dict(),
                     "jepa_loss": mean_jepa,
                     "tpc_loss": mean_tpc,
+                    "invariant_loss": mean_inv,
+                    "total_loss": mean_total,
                     "config": {
                         "embed_dim": embed_dim,
                         "n_layers": n_layers,
                         "n_heads": n_heads,
                         "seq_len": seq_len,
                         "coord_dim": coord_dim,
+                        "tpc_weight": tpc_weight,
+                        "invariant_weight": invariant_weight,
+                        "long_horizon_weight": long_horizon_weight,
+                        "long_horizon_segments": long_horizon_segments,
                     },
                 },
                 output_dir / "best.pt",
@@ -278,6 +331,9 @@ def pretrain(
     metrics = {
         "jepa_losses": jepa_losses,
         "tpc_losses": tpc_losses,
+        "invariant_losses": invariant_losses,
+        "long_horizon_losses": long_horizon_losses,
+        "total_losses": total_losses,
         "best_loss": best_loss,
     }
     with open(output_dir / "metrics.json", "w") as f:
