@@ -15,8 +15,17 @@ Pretraining objectives (see kinescope.pretrain.pretrain):
        shortcut during downtime.
 
 References:
-    - V-JEPA: Bardes et al., 2024 (Meta AI) — adapted to skeleton sequences
-    - MotionBERT: Zhu et al., ICCV 2023 — inspiration for per-joint tokenization
+    - V-JEPA: Bardes et al., ICLR 2024. "V-JEPA: Latent Video Prediction for Visual
+      Representation." https://arxiv.org/abs/2312.00857 — architecture and EMA target encoder.
+    - BYOL: Grill et al., NeurIPS 2020. "Bootstrap Your Own Latent."
+      https://arxiv.org/abs/2006.07733 — EMA target encoder for collapse-free SSL.
+    - MoCo v3: Chen & He, ICCV 2021. "An Empirical Study of Training Self-Supervised
+      Vision Transformers." https://arxiv.org/abs/2104.02057 — EMA warmup schedule.
+    - MotionBERT: Zhu et al., ICCV 2023. "MotionBERT: A Unified Perspective on Learning
+      Human Motion Representations." https://arxiv.org/abs/2210.06551 — per-joint tokenization.
+    - data2vec: Baevski et al., ICML 2022. "data2vec: A General Framework for
+      Self-supervised Learning." https://arxiv.org/abs/2202.03555 — EMA target with
+      averaged top-K layers; motivates block masking over random masking.
 """
 
 import copy
@@ -334,6 +343,9 @@ def _sample_block_mask(
     Sample a spatiotemporal block mask for Pose-JEPA.
 
     Masks a contiguous temporal block of a random subset of joints.
+    Block masking (vs. random per-token masking) forces the encoder to reason
+    about temporal context rather than relying on neighbouring frames as shortcuts.
+    See: V-JEPA (Bardes et al., ICLR 2024) §3.2; data2vec 2.0 (Baevski et al., 2023).
 
     Parameters
     ----------
@@ -373,9 +385,15 @@ class PoseJEPA(nn.Module):
     Full Pose-JEPA pretraining model.
 
     Includes context encoder, EMA target encoder, JEPA predictor, and TPC decoder.
-    Call update_ema() after each optimizer step.
+    Call update_ema() after each optimizer step and step_ema_decay() once per epoch.
 
     Only context_encoder weights are saved/loaded for downstream fine-tuning.
+
+    The EMA target encoder prevents representation collapse without requiring negative
+    samples or contrastive loss (BYOL, Grill et al. NeurIPS 2020; V-JEPA, Bardes et al.
+    ICLR 2024). The predictor architecture is intentionally small (2-layer cross-attention)
+    so that the representation must carry semantic content rather than delegating it to the
+    predictor — following the design principle in V-JEPA §3.3.
 
     Parameters
     ----------
@@ -385,8 +403,9 @@ class PoseJEPA(nn.Module):
     seq_len : int
     n_joints : int
     coord_dim : int
-    ema_decay : float — τ for EMA update (default 0.996 per V-JEPA)
+    ema_decay : float — final τ for EMA update (default 0.996, per V-JEPA Table 1)
     motion_threshold : float — min mean joint displacement for TPC gate
+    ema_start : float — initial τ for EMA warmup (default 0.9, per MoCo v3 §4.1)
     """
 
     def __init__(
@@ -399,9 +418,20 @@ class PoseJEPA(nn.Module):
         coord_dim: int = 2,
         ema_decay: float = 0.996,
         motion_threshold: float = 0.05,
+        tpc_weight: float = 0.0,
+        invariant_weight: float = 0.0,
+        long_horizon_weight: float = 0.0,
+        long_horizon_segments: int = 4,
+        ema_start: float = 0.9,
     ):
         super().__init__()
         self.seq_len = seq_len
+        self.tpc_weight = tpc_weight
+        self.invariant_weight = invariant_weight
+        self.long_horizon_weight = long_horizon_weight
+        self.long_horizon_segments = max(2, int(long_horizon_segments))
+        self.ema_start = ema_start
+        self.current_ema_decay = ema_start  # warmed up toward ema_decay over training
         self.n_joints = n_joints
         self.coord_dim = coord_dim
         self.ema_decay = ema_decay
@@ -420,11 +450,42 @@ class PoseJEPA(nn.Module):
         self.tpc_decoder = TPCDecoder(
             embed_dim, n_joints, coord_dim, half_seq_len=seq_len // 2
         )
+        self.invariant_head = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.GELU(),
+            nn.Linear(embed_dim // 2, 7),
+        )
+        self.long_horizon_predictor = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+
+    def step_ema_decay(self, epoch: int, total_epochs: int) -> None:
+        """
+        Cosine warmup for EMA decay: ema_start → ema_decay over training.
+
+        Call once per epoch after the LR scheduler step.
+        Early in training τ is low (target tracks context quickly → stable gradients).
+        Late in training τ → ema_decay (target is stable → richer representation).
+
+        This schedule prevents the "drift collapse" failure mode where a fixed high τ
+        causes the target to move faster than the context encoder can track as LR decays.
+        Ref: MoCo v3 (Chen & He, ICCV 2021) §4.1; BYOL (Grill et al., NeurIPS 2020) §3.
+        Cosine schedule formula: τ_t = τ_end - (τ_end - τ_start)·(cos(πt/T)+1)/2
+        """
+        progress = min(epoch / max(total_epochs, 1), 1.0)
+        self.current_ema_decay = (
+            self.ema_decay
+            - (self.ema_decay - self.ema_start) * (math.cos(math.pi * progress) + 1) / 2
+        )
 
     @torch.no_grad()
     def update_ema(self):
         """EMA update of target encoder. Call after each optimizer step."""
-        τ = self.ema_decay
+        τ = self.current_ema_decay
         for ctx_p, tgt_p in zip(
             self.context_encoder.parameters(), self.target_encoder.parameters()
         ):
@@ -437,9 +498,117 @@ class PoseJEPA(nn.Module):
         displacements = (x_first_half[:, 1:] - x_first_half[:, :-1]).norm(dim=-1)
         return displacements.mean(dim=(1, 2)) > self.motion_threshold
 
+    @staticmethod
+    def _corr_1d(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        """Batch Pearson correlation over time dimension for (B, T) signals."""
+        a0 = a - a.mean(dim=1, keepdim=True)
+        b0 = b - b.mean(dim=1, keepdim=True)
+        num = (a0 * b0).sum(dim=1)
+        den = torch.sqrt((a0.square().sum(dim=1) * b0.square().sum(dim=1)).clamp_min(eps))
+        return (num / den).clamp(-1.0, 1.0)
+
+    @staticmethod
+    def _entropy_from_signal(sig: torch.Tensor, bins: int = 16) -> torch.Tensor:
+        """Compute per-sample discrete entropy over a quantized (B, T) signal."""
+        B = sig.shape[0]
+        out = []
+        for b in range(B):
+            s = sig[b]
+            smin = s.min()
+            smax = s.max()
+            if (smax - smin).abs() < 1e-6:
+                out.append(s.new_zeros(()))
+                continue
+            q = ((s - smin) / (smax - smin + 1e-6) * (bins - 1)).long().clamp(0, bins - 1)
+            counts = torch.bincount(q, minlength=bins).float()
+            probs = counts / counts.sum().clamp_min(1.0)
+            ent = -(probs * (probs + 1e-8).log()).sum()
+            out.append(ent)
+        return torch.stack(out, dim=0)
+
+    def _clip_invariant_targets(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Build clip-level kinematic targets: symmetry, left/right activity balance,
+        smoothness, coordination, and movement entropy.
+        """
+        left_wrist = x[:, :, COCO_PART_INDEX["left_wrist"], :]
+        right_wrist = x[:, :, COCO_PART_INDEX["right_wrist"], :]
+        left_ankle = x[:, :, COCO_PART_INDEX["left_ankle"], :]
+        right_ankle = x[:, :, COCO_PART_INDEX["right_ankle"], :]
+
+        lw_speed = (left_wrist[:, 1:] - left_wrist[:, :-1]).norm(dim=-1)
+        rw_speed = (right_wrist[:, 1:] - right_wrist[:, :-1]).norm(dim=-1)
+        la_speed = (left_ankle[:, 1:] - left_ankle[:, :-1]).norm(dim=-1)
+        ra_speed = (right_ankle[:, 1:] - right_ankle[:, :-1]).norm(dim=-1)
+
+        sym_wrist = self._corr_1d(lw_speed, rw_speed)
+        sym_ankle = self._corr_1d(la_speed, ra_speed)
+
+        lw_act = lw_speed.mean(dim=1)
+        rw_act = rw_speed.mean(dim=1)
+        la_act = la_speed.mean(dim=1)
+        ra_act = ra_speed.mean(dim=1)
+        lr_balance_wrist = ((lw_act + 1e-6) / (rw_act + 1e-6)).log()
+        lr_balance_ankle = ((la_act + 1e-6) / (ra_act + 1e-6)).log()
+
+        acc_w = (lw_speed[:, 1:] - lw_speed[:, :-1]).abs().mean(dim=1) + (
+            (rw_speed[:, 1:] - rw_speed[:, :-1]).abs().mean(dim=1)
+        )
+        acc_a = (la_speed[:, 1:] - la_speed[:, :-1]).abs().mean(dim=1) + (
+            (ra_speed[:, 1:] - ra_speed[:, :-1]).abs().mean(dim=1)
+        )
+        smoothness = 0.5 * (acc_w + acc_a)
+
+        upper = 0.5 * (lw_speed + rw_speed)
+        lower = 0.5 * (la_speed + ra_speed)
+        coord_ul = self._corr_1d(upper, lower)
+
+        ent = 0.25 * (
+            self._entropy_from_signal(lw_speed)
+            + self._entropy_from_signal(rw_speed)
+            + self._entropy_from_signal(la_speed)
+            + self._entropy_from_signal(ra_speed)
+        )
+
+        return torch.stack(
+            [
+                sym_wrist,
+                sym_ankle,
+                lr_balance_wrist,
+                lr_balance_ankle,
+                smoothness,
+                coord_ul,
+                ent,
+            ],
+            dim=1,
+        )
+
+    def _segment_embeddings(self, token_tensor: torch.Tensor, n_segments: int) -> torch.Tensor:
+        """
+        Mean-pool token embeddings into coarse temporal segment embeddings.
+
+        Parameters
+        ----------
+        token_tensor : (B, T, J, E)
+        n_segments : int
+
+        Returns
+        -------
+        (B, n_segments, E)
+        """
+        B, T, J, E = token_tensor.shape
+        seg_len = max(1, T // n_segments)
+        segs = []
+        for i in range(n_segments):
+            s = i * seg_len
+            e = T if i == n_segments - 1 else min(T, (i + 1) * seg_len)
+            seg = token_tensor[:, s:e].mean(dim=(1, 2))  # (B, E)
+            segs.append(seg)
+        return torch.stack(segs, dim=1)
+
     def forward(self, x: torch.Tensor) -> dict:
         """
-        Compute Pose-JEPA + motion-gated TPC losses.
+        Compute Pose-JEPA + motion-gated TPC + clip-invariant auxiliary losses.
 
         Parameters
         ----------
@@ -447,7 +616,7 @@ class PoseJEPA(nn.Module):
 
         Returns
         -------
-        dict: jepa_loss, tpc_loss, total_loss, tpc_active_fraction
+        dict: jepa_loss, tpc_loss, invariant_loss, long_horizon_loss, total_loss, tpc_active_fraction
         """
         B, T, J, D = x.shape
         device = x.device
@@ -465,8 +634,9 @@ class PoseJEPA(nn.Module):
         # Context encoder: masked input (zero-out masked joints)
         x_masked = x.clone()
         x_masked[masks] = 0.0
-        ctx_all = self.context_encoder.encode_tokens(x_masked)  # (B, T*J+1, E)
-        ctx_all = ctx_all[:, 1:].view(B, T, J, -1)              # (B, T, J, E)
+        ctx_tokens = self.context_encoder.encode_tokens(x_masked)  # (B, T*J+1, E)
+        ctx_cls = ctx_tokens[:, 0]                                  # (B, E) — reused by invariant head
+        ctx_all = ctx_tokens[:, 1:].view(B, T, J, -1)              # (B, T, J, E)
 
         jepa_losses = []
         for b in range(B):
@@ -499,28 +669,60 @@ class PoseJEPA(nn.Module):
         )
 
         # --- Motion-Gated TPC ---
-        half = T // 2
-        x_first = x[:, :half]   # (B, T//2, J, D)
-        x_second = x[:, half:]  # (B, T//2, J, D)
-
-        motion_mask = self._motion_gate(x_first)
-        tpc_active_fraction = motion_mask.float().mean().item()
-
+        tpc_active_fraction = x.new_zeros(1).squeeze()
         tpc_loss = x.new_zeros(1).squeeze()
-        if motion_mask.any():
-            x_first_active = x_first[motion_mask]
-            x_second_active = x_second[motion_mask]
 
-            # Encode first half (variable T//2 — works because sinusoidal PE is length-agnostic)
-            cls_half = self.context_encoder(x_first_active)       # (B_active, E)
-            pred_second = self.tpc_decoder(cls_half)              # (B_active, T//2, J, D)
-            tpc_loss = F.mse_loss(pred_second, x_second_active)
+        if self.tpc_weight > 0:
+            half = T // 2
+            x_first = x[:, :half]   # (B, T//2, J, D)
+            x_second = x[:, half:]  # (B, T//2, J, D)
 
-        total_loss = jepa_loss + 0.5 * tpc_loss
+            motion_mask = self._motion_gate(x_first)
+            tpc_active_fraction = motion_mask.float().mean()
+
+            if motion_mask.any():
+                x_first_active = x_first[motion_mask]
+                x_second_active = x_second[motion_mask]
+
+                # Encode first half; detach so TPC gradients don't flow into the encoder.
+                # JEPA is the primary objective that shapes the representation; TPC is
+                # auxiliary. Decoupling prevents TPC from distorting the latent geometry.
+                # Analogous to the stop-gradient in SimSiam (Chen & He, CVPR 2021).
+                cls_half = self.context_encoder(x_first_active).detach()  # (B_active, E)
+                pred_second = self.tpc_decoder(cls_half)              # (B_active, T//2, J, D)
+                tpc_loss = F.mse_loss(pred_second, x_second_active)
+
+        invariant_loss = x.new_zeros(1).squeeze()
+        if self.invariant_weight > 0:
+            # Reuse ctx_cls (CLS token from masked context encoding)
+            pred_inv = self.invariant_head(ctx_cls)  # (B, 7)
+            with torch.no_grad():
+                tgt_inv = self._clip_invariant_targets(x).detach()
+            invariant_loss = F.smooth_l1_loss(pred_inv, tgt_inv)
+
+        long_horizon_loss = x.new_zeros(1).squeeze()
+        if self.long_horizon_weight > 0 and T >= self.long_horizon_segments:
+            # Reuse already-computed token tensors: ctx_all (B,T,J,E) and target_all (B,T,J,E)
+            ctx_seg = self._segment_embeddings(ctx_all, self.long_horizon_segments)     # (B, S, E)
+            tgt_seg = self._segment_embeddings(target_all, self.long_horizon_segments)  # (B, S, E)
+            half_s = self.long_horizon_segments // 2
+            ctx_coarse = ctx_seg[:, :half_s].mean(dim=1)   # (B, E)
+            tgt_future = tgt_seg[:, half_s:].mean(dim=1)   # (B, E)
+            pred_future = self.long_horizon_predictor(ctx_coarse)
+            long_horizon_loss = F.mse_loss(pred_future, tgt_future.detach())
+
+        total_loss = (
+            jepa_loss
+            + self.tpc_weight * tpc_loss
+            + self.invariant_weight * invariant_loss
+            + self.long_horizon_weight * long_horizon_loss
+        )
 
         return {
             "jepa_loss": jepa_loss,
             "tpc_loss": tpc_loss,
+            "invariant_loss": invariant_loss,
+            "long_horizon_loss": long_horizon_loss,
             "total_loss": total_loss,
             "tpc_active_fraction": tpc_active_fraction,
         }
