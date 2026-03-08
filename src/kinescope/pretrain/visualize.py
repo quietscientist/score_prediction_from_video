@@ -20,6 +20,30 @@ LIMB_JOINT_INDICES = set(COCO_PART_INDEX[j] for j in LIMB_JOINTS)
 _FACE_JOINTS = frozenset(range(5))
 _BODY_LIMBS = [(i, j) for i, j in COCO_LIMBS if i not in _FACE_JOINTS and j not in _FACE_JOINTS]
 
+# Lower body joint indices (11–16): hip, knee, ankle on each side
+_LOWER_BODY = frozenset(range(11, 17))
+
+
+def _normalized_to_display(frame: np.ndarray) -> np.ndarray:
+    """
+    Convert a normalized COCO-17 frame to a displayable coordinate system.
+
+    After normalize_clip(), the coordinate system is split:
+      - Upper body (joints 0–10): y=0 = shoulder center, positive y = physically above
+      - Lower body (joints 11–16): y=1.0 = hip center, smaller y = physically below hips
+
+    To unify into a single global y-up frame centred at the shoulder midpoint:
+      - Upper body: keep as-is
+      - Lower body: subtract 2.0 from y  →  hip becomes (1.0 - 2.0) = -1.0
+        (i.e., one trunk-length below shoulder), knee/ankle go further negative
+
+    Plot with matplotlib default (y increases upward, no invert_yaxis).
+    """
+    disp = frame.copy()
+    for idx in _LOWER_BODY:
+        disp[idx, 1] -= 2.0
+    return disp
+
 
 def _draw_skeleton(
     ax,
@@ -28,7 +52,8 @@ def _draw_skeleton(
     limb_color: str = "gray",
     masked_joints: Optional[np.ndarray] = None,
 ):
-    """Draw a single skeleton frame (body joints only). frame: (17, 2) array."""
+    """Draw a single skeleton frame (body joints only). frame: (17, 2) normalized array."""
+    frame = _normalized_to_display(frame)
     for i, j in _BODY_LIMBS:
         if np.isnan(frame[i]).any() or np.isnan(frame[j]).any():
             continue
@@ -86,7 +111,6 @@ def plot_pose_clip(
         _draw_skeleton(ax, clip[t])
         ax.set_title(f"frame {t}", fontsize=8)
         ax.set_aspect("equal")
-        ax.invert_yaxis()
         ax.axis("off")
 
     for k in range(n_frames, len(axes)):
@@ -130,7 +154,6 @@ def plot_masked_clip(
         _draw_skeleton(ax, clip[t], masked_joints=masked_joints)
         ax.set_title(f"t={t} | masked={masked_joints.sum()}", fontsize=7)
         ax.set_aspect("equal")
-        ax.invert_yaxis()
         ax.axis("off")
 
     for k in range(n_frames, len(axes)):
