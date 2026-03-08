@@ -55,6 +55,46 @@ N_JOINTS = len(COCO_PART_NAMES)  # 17
 # See /home/msegado/tapedeck/msegado/rekinect-pose/rekinect/joints/mapping.py
 
 
+def _parse_gender(value) -> str:
+    """
+    Normalize AMASS gender metadata to {'male', 'female', 'neutral'}.
+
+    AMASS files may store gender as bytes, numpy scalar, or string.
+    """
+    if isinstance(value, np.ndarray):
+        if value.ndim == 0:
+            value = value.item()
+        elif value.size > 0:
+            value = value.reshape(-1)[0]
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode("utf-8", errors="ignore")
+
+    gender = str(value).strip().lower()
+    return gender if gender in ("male", "female") else "neutral"
+
+
+def _resolve_model_root() -> pathlib.Path:
+    """
+    Resolve SMPL model root directory.
+
+    Priority:
+      1) $SMPL_MODELS
+      2) <repo>/external/smplx/body_models
+      3) ~/smpl_models (legacy default)
+    """
+    import os
+
+    env = os.environ.get("SMPL_MODELS")
+    if env:
+        return pathlib.Path(env)
+
+    repo_default = pathlib.Path(__file__).resolve().parents[3] / "external" / "smplx" / "body_models"
+    if repo_default.exists():
+        return repo_default
+
+    return pathlib.Path.home() / "smpl_models"
+
+
 def _find_model_file(model_root: pathlib.Path, gender: str, pose_dim: int) -> pathlib.Path:
     """
     Locate the SMPL/SMPL-H model npz for a given gender.
@@ -63,7 +103,7 @@ def _find_model_file(model_root: pathlib.Path, gender: str, pose_dim: int) -> pa
       - smplx-style:  {root}/smplh/{gender}/model.npz   (human_body_prior layout)
       - classic-style: {root}/smplh/SMPLH_{GENDER}.npz
     """
-    gender = gender if gender in ("male", "female") else "neutral"
+    gender = _parse_gender(gender)
     model_type = "smplh" if pose_dim > 72 else "smpl"
 
     candidates = [
@@ -96,8 +136,7 @@ def _smpl_forward_kinematics(poses: np.ndarray, betas: np.ndarray, gender: str =
     -------
     (T, 24, 3) float32 — world-space joint positions
     """
-    import os
-    model_root = pathlib.Path(os.environ.get("SMPL_MODELS", str(pathlib.Path.home() / "smpl_models")))
+    model_root = _resolve_model_root()
 
     T = poses.shape[0]
     pose_dim = poses.shape[1]
@@ -231,36 +270,71 @@ def load_amass_clips(
         npz_files = npz_files[:max_files]
 
     all_clips = []
-    step = seq_len // 2
+    step = max(1, seq_len // 2)
+
+    # Keep explicit skip diagnostics so "0 clips" is actionable.
+    stats = {
+        "npz_load_error": 0,
+        "missing_or_short_pose": 0,
+        "fk_error": 0,
+        "mapping_or_normalization_error": 0,
+        "clip_threshold_reject": 0,
+    }
+    first_fk_error = None
+    first_map_or_norm_error = None
 
     for npz_path in npz_files:
         try:
             data = np.load(npz_path, allow_pickle=True)
         except Exception:
+            stats["npz_load_error"] += 1
             continue
 
         poses = data.get("poses")
         betas = data.get("betas", np.zeros(10))
-        gender = str(data.get("gender", "neutral"))
+        gender = _parse_gender(data.get("gender", "neutral"))
 
         if poses is None or len(poses) < seq_len:
+            stats["missing_or_short_pose"] += 1
             continue
 
         try:
             joints = _smpl_forward_kinematics(poses, betas, gender)  # (T, 24, 3)
-        except Exception:
+        except Exception as exc:
+            stats["fk_error"] += 1
+            if first_fk_error is None:
+                first_fk_error = (npz_path, exc)
             continue
 
-        coco_2d = _smpl_joints_to_coco(joints)  # (T, 17, 2)
-        normalized = normalize_clip(coco_2d)     # (T, 17, 2)
+        try:
+            coco_2d = _smpl_joints_to_coco(joints)  # (T, 17, 2)
+            normalized = normalize_clip(coco_2d)   # (T, 17, 2)
+        except Exception as exc:
+            stats["mapping_or_normalization_error"] += 1
+            if first_map_or_norm_error is None:
+                first_map_or_norm_error = (npz_path, exc)
+            continue
 
         T = normalized.shape[0]
         for start in range(0, T - seq_len + 1, step):
             clip = normalized[start : start + seq_len]
             if np.abs(clip).max() < 5.0:  # reject normalization failures
                 all_clips.append(clip)
+            else:
+                stats["clip_threshold_reject"] += 1
 
     if not all_clips:
-        return np.empty((0, seq_len, N_JOINTS, 2), dtype=np.float32)
+        details = [f"{k}={v}" for k, v in stats.items()]
+        msg = (
+            f"AMASS produced 0 clips from {len(npz_files)} files under {data_dir}. "
+            f"Skip stats: {', '.join(details)}."
+        )
+        if first_fk_error is not None:
+            path, exc = first_fk_error
+            msg += f" First FK error at {path}: {type(exc).__name__}: {exc}"
+        elif first_map_or_norm_error is not None:
+            path, exc = first_map_or_norm_error
+            msg += f" First map/normalize error at {path}: {type(exc).__name__}: {exc}"
+        raise RuntimeError(msg)
 
     return np.stack(all_clips).astype(np.float32)

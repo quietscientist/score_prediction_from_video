@@ -23,7 +23,8 @@ class ClipDataset(Dataset):
     """
 
     def __init__(self, clips, motion_weights=None):
-        self.clips = torch.tensor(np.asarray(clips), dtype=torch.float32)
+        # Keep as numpy (supports memmap arrays — data is paged in on access).
+        self.clips = clips if isinstance(clips, np.ndarray) else np.asarray(clips)
         self.motion_weights = (
             np.asarray(motion_weights, dtype=np.float32)
             if motion_weights is not None
@@ -34,7 +35,11 @@ class ClipDataset(Dataset):
         return len(self.clips)
 
     def __getitem__(self, idx):
-        return self.clips[idx]
+        # Defensive sanitization: cached arrays from mixed datasets can contain
+        # NaN/Inf outliers that would otherwise poison the JEPA loss.
+        clip = np.array(self.clips[idx], dtype=np.float32, copy=True)
+        clip = np.nan_to_num(clip, nan=0.0, posinf=0.0, neginf=0.0)
+        return torch.tensor(clip, dtype=torch.float32)
 
     @staticmethod
     def compute_motion_weights(

@@ -42,6 +42,7 @@ KNOWN_DATASETS = {
     "amass":   "AMASS",
     "humoto":  "humoto_",
     "ntu120":  ["nturgbd_skeletons_s018_to_s032", "nturgb+d_skeletons"],
+    "penn":    "Penn_Action",
     "coco":    "coco",
 }
 
@@ -90,16 +91,18 @@ def load_clips(
     seq_len: int = 60,
     data_root: Optional[str] = None,
     verbose: bool = True,
+    max_files_per_dataset: Optional[int] = None,
 ) -> np.ndarray:
     """
     Load and concatenate clips from one or more datasets.
 
     Parameters
     ----------
-    datasets : list of str — any of: amass, humoto, ntu120, coco
+    datasets : list of str — any of: amass, humoto, ntu120, penn, coco
     seq_len : int — clip length in frames
     data_root : str or None — override data root
     verbose : bool
+    max_files_per_dataset : int or None — cap source files per dataset (for smoke tests)
 
     Returns
     -------
@@ -114,25 +117,30 @@ def load_clips(
 
         if name == "amass":
             from kinescope.pretrain.amass_loader import load_amass_clips
-            clips_list = [load_amass_clips(p, seq_len=seq_len) for p in paths]
+            clips_list = [load_amass_clips(p, seq_len=seq_len, max_files=max_files_per_dataset) for p in paths]
             clips = np.concatenate(clips_list, axis=0) if len(clips_list) > 1 else clips_list[0]
 
         elif name == "humoto":
             from kinescope.pretrain.fbx_loader import load_humoto_clips
             # humoto_ has humoto_0805 and humoto_objects_0805 inside;
             # load_humoto_clips handles the filtering internally.
-            clips_list = [load_humoto_clips(p, seq_len=seq_len) for p in paths]
+            clips_list = [load_humoto_clips(p, seq_len=seq_len, max_files=max_files_per_dataset) for p in paths]
             clips = np.concatenate(clips_list, axis=0) if len(clips_list) > 1 else clips_list[0]
 
         elif name == "ntu120":
             from kinescope.pretrain.ntu_loader import load_ntu_clips
             # Both NTU dirs are scanned and combined
-            clips_list = [load_ntu_clips(p, seq_len=seq_len) for p in paths]
+            clips_list = [load_ntu_clips(p, seq_len=seq_len, max_files=max_files_per_dataset) for p in paths]
             clips = np.concatenate([c for c in clips_list if len(c) > 0], axis=0)
 
         elif name == "coco":
             from kinescope.pretrain.coco_loader import load_coco_clips
             clips_list = [load_coco_clips(p, seq_len=seq_len) for p in paths]
+            clips = np.concatenate(clips_list, axis=0) if len(clips_list) > 1 else clips_list[0]
+
+        elif name == "penn":
+            from kinescope.pretrain.penn_loader import load_penn_clips
+            clips_list = [load_penn_clips(p, seq_len=seq_len, max_files=max_files_per_dataset) for p in paths]
             clips = np.concatenate(clips_list, axis=0) if len(clips_list) > 1 else clips_list[0]
 
         else:

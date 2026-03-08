@@ -315,6 +315,7 @@ def load_humoto_clips(
     data_dir: pathlib.Path,
     seq_len: int = 60,
     coord_dim: int = 2,
+    max_files: int = None,
 ) -> np.ndarray:
     """
     Load all HUMOTO GLB sequences, convert Mixamo → COCO-17, normalize, and chunk.
@@ -327,6 +328,7 @@ def load_humoto_clips(
     data_dir : Path — humoto root (e.g., .../humoto_/)
     seq_len : int — clip length in frames
     coord_dim : int — 2 to project XY, 3 to keep XYZ
+    max_files : int or None — limit number of .glb files (useful for quick testing)
 
     Returns
     -------
@@ -339,6 +341,9 @@ def load_humoto_clips(
         p for p in data_dir.rglob("*.glb")
         if "objects" not in p.parts[-3]  # skip humoto_objects_0805 subdir
     )
+
+    if max_files is not None:
+        glb_files = glb_files[:max_files]
 
     if not glb_files:
         raise FileNotFoundError(

@@ -165,11 +165,8 @@ def load_ntu_clips(
     skeleton_files = sorted(data_dir.rglob("*.skeleton"))
 
     if not skeleton_files:
-        raise FileNotFoundError(
-            f"No .skeleton files found in {data_dir}.\n"
-            f"Download NTU RGB+D 120 from https://rose1.ntu.edu.sg/dataset/actionRecognition/"
-            f" and extract into {data_dir}"
-        )
+        print(f"NTU: no .skeleton files in {data_dir}, skipping.")
+        return np.empty((0, seq_len, N_JOINTS, 2), dtype=np.float32)
 
     if max_files is not None:
         skeleton_files = skeleton_files[:max_files]
