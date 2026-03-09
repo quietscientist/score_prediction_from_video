@@ -52,10 +52,6 @@ def _cmd_linearprobe(args):
         data_dir=args.data_dir,
         pretrained_weights=args.pretrained_weights,
         output_dir=args.output,
-        seq_len=args.seq_len,
-        embed_dim=args.embed_dim,
-        n_layers=args.n_layers,
-        n_heads=args.n_heads,
         ridge_alpha=args.ridge_alpha,
         device=args.device,
         artifacts_dir=args.artifacts_dir,
@@ -207,24 +203,25 @@ def main():
                       help="Number of temporal segments per clip for long-horizon objective (default: 4).")
     p_pt.set_defaults(func=_cmd_pretrain)
 
-    # ── linearprobe ──────────────────────────────────────────────────────────
-    p_lp = sub.add_parser("linearprobe",
-                           help="LOSO linear probe evaluation on a labeled clinical dataset")
-    p_lp.add_argument("--data-dir",           required=True, dest="data_dir",
-                      help="Path to UDysRS_UPDRS_Export directory")
-    p_lp.add_argument("--pretrained-weights", default=None, dest="pretrained_weights",
-                      help="Path to pretrained ViT checkpoint (.pt). Omit for random-init baseline.")
-    p_lp.add_argument("--output",             default="results/linearprobe",
-                      help="Output directory for metrics and plots (default: results/linearprobe)")
-    p_lp.add_argument("--seq-len",            type=int,   default=60,   dest="seq_len")
-    p_lp.add_argument("--embed-dim",          type=int,   default=256,  dest="embed_dim")
-    p_lp.add_argument("--n-layers",           type=int,   default=6,    dest="n_layers")
-    p_lp.add_argument("--n-heads",            type=int,   default=8,    dest="n_heads")
-    p_lp.add_argument("--ridge-alpha",        type=float, default=1.0,  dest="ridge_alpha")
-    p_lp.add_argument("--device",             default="auto",
-                      choices=["auto", "cpu", "cuda", "mps"])
-    p_lp.add_argument("--artifacts-dir",      default="artifacts",      dest="artifacts_dir")
-    p_lp.set_defaults(func=_cmd_linearprobe)
+    # ── probe (linearprobe) ───────────────────────────────────────────────────
+    # Architecture config is read automatically from the checkpoint file.
+    # For a random-init baseline, omit --pretrained-weights (defaults to 128/4/4/60).
+    for probe_name in ("probe", "linearprobe"):
+        p_lp = sub.add_parser(probe_name,
+                               help="LOSO linear probe evaluation on UDysRS (alias: probe / linearprobe)")
+        p_lp.add_argument("--data-dir",           required=True, dest="data_dir",
+                          help="Path to UDysRS_UPDRS_Export directory")
+        p_lp.add_argument("--pretrained-weights", default=None, dest="pretrained_weights",
+                          help="Path to pretrained ViT checkpoint (.pt). "
+                               "Architecture config is read from the checkpoint. "
+                               "Omit for random-init baseline (128/4/4).")
+        p_lp.add_argument("--output",             default="results/linearprobe",
+                          help="Output directory for metrics and plots (default: results/linearprobe)")
+        p_lp.add_argument("--ridge-alpha",        type=float, default=1.0,  dest="ridge_alpha")
+        p_lp.add_argument("--device",             default="auto",
+                          choices=["auto", "cpu", "cuda", "mps"])
+        p_lp.add_argument("--artifacts-dir",      default="artifacts",      dest="artifacts_dir")
+        p_lp.set_defaults(func=_cmd_linearprobe)
 
     parsed = parser.parse_args()
     parsed.func(parsed)
