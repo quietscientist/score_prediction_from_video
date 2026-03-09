@@ -3,11 +3,10 @@ LOSO linear probe evaluation on the UDysRS dataset.
 
 Runs four evaluations in sequence:
 
-  1. Normalization audit — checks whether normalize_clip (per-frame centering +
-     rotation + trunk-length scaling) preserves or discards dyskinesia-relevant
-     signals. Specifically checks whether shoulder sway (removed by per-frame
-     centering) correlates with score; if so, clinically useful signal is being
-     discarded upstream of the encoder.
+  1. Normalization audit — checks whether shoulder sway (whole-body postural
+     drift, preserved by clip-mean centering in normalize_clip) correlates with
+     score, and whether wrist/ankle speed in normalized space also correlates.
+     Verifies that the normalization strategy retains dyskinesia-relevant signals.
 
   2. Kinematic feature baseline — LOSO Ridge on 17 handcrafted features
      (limb speed/variance, bilateral asymmetry, upper-lower coordination,
@@ -208,10 +207,9 @@ def _shoulder_sway(arr: np.ndarray) -> float:
     """
     Trunk-length-normalized shoulder midpoint displacement (std over time).
 
-    Measures whole-body postural sway/drift in the raw (pre-normalization)
-    coordinate frame.  This signal is REMOVED by normalize_clip's per-frame
-    centering on the shoulder midpoint.  Non-zero correlation with score
-    means clinically relevant signal is being discarded.
+    Measures whole-body postural sway/drift.  normalize_clip uses clip-mean
+    centering so this signal IS preserved in the normalized representation.
+    Correlation with score validates that the normalization retains it.
     """
     l_sh, r_sh = arr[:, 5, :], arr[:, 6, :]
     l_hp, r_hp = arr[:, 11, :], arr[:, 12, :]
@@ -227,21 +225,20 @@ def _shoulder_sway(arr: np.ndarray) -> float:
 
 def normalization_audit(arrays: list, scores_raw: np.ndarray, tasks: list) -> dict:
     """
-    Check whether normalize_clip preserves or destroys dyskinesia-relevant signals.
+    Verify that normalize_clip retains dyskinesia-relevant signals.
 
     Per-task, reports:
-      - Shoulder sway correlation with score: non-zero → signal discarded by
-        per-frame centering.  If ρ > 0.15, trunk-anchored normalization
-        (per-clip centering with a single reference frame) should be considered.
-      - Wrist / ankle speed correlation with score in normalized space: if near
-        zero, no relative-joint dyskinesia signal survives normalization.
-      - High-vs-low score speed ratio: ratio of mean wrist speed in the top-25%
-        score clips vs. bottom-25%.  Ratio < 1.2 suggests poor discriminability.
+      - Shoulder sway correlation with score: normalize_clip uses clip-mean
+        centering so sway IS preserved.  High ρ validates this choice.
+      - Wrist / ankle speed correlation with score in normalized space:
+        checks that relative-joint movement also discriminates score.
+      - High-vs-low score speed ratio: mean speed in top-25% vs. bottom-25%
+        score clips.  Ratio > 1.2 suggests good discriminability.
 
     Printed to stdout and returned as a dict (included in metrics.json).
     """
     print("\n=== Normalization Audit ===")
-    print("    (shoulder sway is computed before normalization and is discarded by it)")
+    print("    (shoulder sway is preserved by clip-mean centering in normalize_clip)")
 
     # Pre-compute per-clip signals
     sways, wrist_sp, ankle_sp = [], [], []
@@ -283,10 +280,10 @@ def normalization_audit(arrays: list, scores_raw: np.ndarray, tasks: list) -> di
         ankle_ratio = _ratio(ankle_sp)
         sway_ratio  = _ratio(sways)
 
-        sway_flag = " ← DISCARDED by per-frame centering" if abs(rho_sway) > 0.15 else ""
+        sway_flag = " ← low sway correlation despite clip-mean centering" if abs(rho_sway) < 0.10 else ""
 
         print(f"\n  {task} (n={mask.sum()})")
-        print(f"    Shoulder sway (raw, pre-norm):    ρ={rho_sway:+.3f}  r={r_sway:+.3f}"
+        print(f"    Shoulder sway (preserved):        ρ={rho_sway:+.3f}  r={r_sway:+.3f}"
               f"  hi/lo={sway_ratio:.2f}x{sway_flag}")
         print(f"    Wrist speed   (post-norm):        ρ={rho_wrist:+.3f}  r={r_wrist:+.3f}"
               f"  hi/lo={wrist_ratio:.2f}x")

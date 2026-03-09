@@ -4,7 +4,18 @@ Numpy-native skeleton normalization for pretraining data loaders.
 Replicates normalise_skeletons() from processing/normalization.py but operates
 directly on (T, 17, 2) numpy arrays without requiring a pandas DataFrame.
 
-Used by amass_loader, ntu_loader, fbx_loader, and coco_loader.
+Used by amass_loader, ntu_loader, fbx_loader, coco_loader, and the linear probe.
+
+Normalization strategy
+----------------------
+Translation:  centered on the CLIP-MEAN shoulder/hip midpoint (not per-frame).
+              This preserves whole-body sway — the temporal variation of the body
+              center — which is clinically relevant for conditions like dyskinesia.
+              Per-frame centering would subtract out this signal entirely.
+Rotation:     per-frame shoulder/hip angle, rotated to canonical upright orientation.
+              Removes camera angle and within-frame body tilt.
+Scale:        per-frame trunk length (shoulder-center to hip-center distance).
+              Removes subject height and distance-to-camera variation.
 """
 
 import numpy as np
@@ -41,12 +52,15 @@ def normalize_clip(clip: np.ndarray) -> np.ndarray:
     """
     Normalize a COCO-17 pose clip to body-relative coordinates.
 
-    Replicates normalise_skeletons() per-frame:
-      1. Compute shoulder/hip midpoints (uref, lref)
-      2. Compute shoulder/hip orientation angles
-      3. Rotate upper/lower body separately to align body axis vertically
-      4. Scale by trunk length (shoulder-center to hip-center distance)
-      5. Shift lower body so trunk bottom = y=1, trunk top = y=0
+    Steps:
+      1. Compute clip-mean shoulder/hip midpoints as translation reference.
+         Using the clip mean (not per-frame) preserves whole-body sway —
+         the temporal displacement of the body center relative to its average
+         position — which is a clinically relevant signal for movement disorders.
+      2. Per-frame: compute shoulder/hip orientation angles and rotate to align
+         the body axis vertically.
+      3. Per-frame: scale by trunk length (shoulder-center to hip-center distance).
+      4. Shift lower body so trunk bottom = y=1, trunk top = y=0.
 
     Parameters
     ----------
@@ -62,45 +76,54 @@ def normalize_clip(clip: np.ndarray) -> np.ndarray:
     assert D == 2, "normalize_clip requires 2D input (T, J, 2). Project 3D to 2D first."
     assert J == 17, f"Expected 17 COCO joints, got {J}"
 
+    # Clip-mean midpoints for translation — preserves sway across frames
+    l_sh_all = clip[:, _L_SHOULDER, :]  # (T, 2)
+    r_sh_all = clip[:, _R_SHOULDER, :]
+    l_hp_all = clip[:, _L_HIP, :]
+    r_hp_all = clip[:, _R_HIP, :]
+    mean_uref = np.nanmean((l_sh_all + r_sh_all) / 2.0, axis=0)  # (2,)
+    mean_lref = np.nanmean((l_hp_all + r_hp_all) / 2.0, axis=0)  # (2,)
+
     out = np.zeros_like(clip)
 
     for t in range(T):
         frame = clip[t]  # (17, 2)
 
-        l_sh = frame[_L_SHOULDER]  # left_shoulder
-        r_sh = frame[_R_SHOULDER]  # right_shoulder
-        l_hp = frame[_L_HIP]       # left_hip
-        r_hp = frame[_R_HIP]       # right_hip
+        l_sh = frame[_L_SHOULDER]
+        r_sh = frame[_R_SHOULDER]
+        l_hp = frame[_L_HIP]
+        r_hp = frame[_R_HIP]
 
-        uref = (l_sh + r_sh) / 2.0   # shoulder midpoint
-        lref = (l_hp + r_hp) / 2.0   # hip midpoint
+        uref_t = (l_sh + r_sh) / 2.0   # per-frame shoulder midpoint (rotation ref)
+        lref_t = (l_hp + r_hp) / 2.0   # per-frame hip midpoint (rotation ref)
 
-        trunk_len = np.linalg.norm(uref - lref)
+        trunk_len = np.linalg.norm(uref_t - lref_t)
         if trunk_len < 1e-6:
             out[t] = frame  # can't normalize; keep original
             continue
 
-        # Reference angles
+        # Per-frame orientation angles (rotation + scale remain frame-local)
         sh_angle = np.arctan2(r_sh[1] - l_sh[1], r_sh[0] - l_sh[0])
         hp_angle = np.arctan2(r_hp[1] - l_hp[1], r_hp[0] - l_hp[0])
 
         sh_angle_adj = _adjust_angle(np.array([sh_angle]))[0]
         hp_angle_adj = _adjust_angle(np.array([hp_angle]))[0]
 
-        # Normalize upper body joints
-        for j in _UPPER:
-            dx = frame[j, 0] - uref[0]
-            dy = frame[j, 1] - uref[1]
-            ca, sa = np.cos(sh_angle_adj), np.sin(sh_angle_adj)
-            out[t, j, 0] = (ca * dx - sa * dy) / trunk_len
-            out[t, j, 1] = (sa * dx + ca * dy) / trunk_len
+        # Translate relative to clip-mean midpoint (sway preserved),
+        # then rotate by per-frame angle and scale by per-frame trunk length
+        ca_u, sa_u = np.cos(sh_angle_adj), np.sin(sh_angle_adj)
+        ca_l, sa_l = np.cos(hp_angle_adj), np.sin(hp_angle_adj)
 
-        # Normalize lower body joints (shift y by +1 so trunk bottom = 1)
+        for j in _UPPER:
+            dx = frame[j, 0] - mean_uref[0]
+            dy = frame[j, 1] - mean_uref[1]
+            out[t, j, 0] = (ca_u * dx - sa_u * dy) / trunk_len
+            out[t, j, 1] = (sa_u * dx + ca_u * dy) / trunk_len
+
         for j in _LOWER:
-            dx = frame[j, 0] - lref[0]
-            dy = frame[j, 1] - lref[1]
-            ca, sa = np.cos(hp_angle_adj), np.sin(hp_angle_adj)
-            out[t, j, 0] = (ca * dx - sa * dy) / trunk_len
-            out[t, j, 1] = (sa * dx + ca * dy) / trunk_len + 1.0
+            dx = frame[j, 0] - mean_lref[0]
+            dy = frame[j, 1] - mean_lref[1]
+            out[t, j, 0] = (ca_l * dx - sa_l * dy) / trunk_len
+            out[t, j, 1] = (sa_l * dx + ca_l * dy) / trunk_len + 1.0
 
     return out
