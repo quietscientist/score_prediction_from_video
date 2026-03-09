@@ -150,7 +150,10 @@ def pretrain(
         dev = torch.device(device)
 
     print(f"Device: {dev}")
-    _ = mlflow_experiment, use_amp  # kept for CLI compatibility
+    _ = mlflow_experiment  # kept for CLI compatibility
+    amp_enabled = use_amp and dev.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+    print(f"AMP: {'enabled' if amp_enabled else 'disabled'}")
 
     # Load clips
     if datasets is not None:
@@ -247,12 +250,16 @@ def pretrain(
 
         for batch in loader:
             batch = batch.to(dev)
-            out = model(batch)
 
             optimizer.zero_grad()
-            out["total_loss"].backward()
+            with torch.cuda.amp.autocast(enabled=amp_enabled):
+                out = model(batch)
+
+            scaler.scale(out["total_loss"]).backward()
+            scaler.unscale_(optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0).item()
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             model.update_ema()
 
             epoch_jepa.append(out["jepa_loss"].item())
