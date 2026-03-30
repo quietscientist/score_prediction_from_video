@@ -8,10 +8,11 @@ Runs four evaluations in sequence:
      score, and whether wrist/ankle speed in normalized space also correlates.
      Verifies that the normalization strategy retains dyskinesia-relevant signals.
 
-  2. Kinematic feature baseline — LOSO Ridge on 17 handcrafted features
-     (limb speed/variance, bilateral asymmetry, upper-lower coordination,
-     smoothness/jerk, range of motion) computed from normalized arrays.
-     Sets the floor: if the encoder doesn't beat this, pretraining isn't helping.
+  2. Kinematic feature baseline — LOSO Ridge on 38 handcrafted features
+     matching the GigaScience 2025 paper (XY kinematics for wrist/ankle,
+     joint angles for elbow/knee, L/R correlations) computed from normalized
+     arrays.  Sets the floor: if the encoder doesn't beat this, pretraining
+     isn't helping.
 
   3. Combined probe — LOSO Ridge on frozen encoder embeddings, all tasks
      combined with per-task z-scored targets.
@@ -79,6 +80,14 @@ def _load_encoder(pretrained_weights: Optional[str], device):
         n_layers  = cfg.get("n_layers",  n_layers)
         n_heads   = cfg.get("n_heads",   n_heads)
         seq_len   = cfg.get("seq_len",   seq_len)
+        # Fall back to shape inference when checkpoint lacks a config block
+        state = ckpt.get("context_encoder", ckpt)
+        if not cfg:
+            pe_shape = state["token_embedding.temporal_pe.pe"].shape
+            embed_dim = pe_shape[1]
+            seq_len   = pe_shape[0] - 64  # max_seq_len = seq_len + 64
+            n_heads   = max(1, embed_dim // 32)
+            n_layers  = sum(1 for k in state if k.startswith("transformer.layers.") and k.endswith(".self_attn.in_proj_weight"))
 
     encoder = PoseViT(embed_dim=embed_dim, n_layers=n_layers, n_heads=n_heads,
                       seq_len=seq_len).to(device)
@@ -140,65 +149,154 @@ def _encode_clips(arrays: list, encoder, seq_len: int, device) -> np.ndarray:
 
 def _compute_kinematic_features(arrays: list) -> np.ndarray:
     """
-    Compute 17 handcrafted kinematic features from raw (T, 17, 2) arrays.
-    normalize_clip is applied internally.  Returns (N, 17) float32.
+    Compute 38 kinematic features matching the GigaScience 2025 paper feature set.
+    normalize_clip is applied internally.  Returns (N, 38) float32.
 
-    Features (all in trunk-length-normalized coordinates):
-      [0-3]  mean speed: left_wrist, right_wrist, left_ankle, right_ankle
-      [4-7]  speed variance: same joints
-      [8]    wrist bilateral asymmetry  |mean_lw - mean_rw|
-      [9]    ankle bilateral asymmetry  |mean_la - mean_ra|
-      [10]   wrist bilateral correlation (symmetry of timing)
-      [11]   ankle bilateral correlation
-      [12]   upper-lower coordination (wrist speed vs. ankle speed)
-      [13]   wrist smoothness: mean |Δspeed| (jerk proxy)
-      [14]   ankle smoothness
-      [15]   wrist range of motion (std of x position, both wrists summed)
-      [16]   ankle range of motion (std of y position, both ankles summed)
+    Features (trunk-length-normalized coordinates):
+      XY features for wrist (L+R averaged, 11 each = 22):
+        medianx, mediany, IQRx, IQRy, medianvelx, medianvely,
+        IQRvelx, IQRvely, IQRaccx, IQRaccy, meanent
+      XY features for ankle (L+R averaged, 11 = 22 total):
+        same set as wrist
+      Angle features for elbow (L+R averaged, 6 each = 12 total):
+        mean_angle, stdev_angle, entropy_angle,
+        median_vel_angle, IQR_vel_angle, IQR_acc_angle
+      Angle features for knee (L+R averaged, 6 = 24 total):
+        same set as elbow
+      L/R correlations (4):
+        Wrist_lrCorr_x, Ankle_lrCorr_x, Elbow_lrCorr_angle, Knee_lrCorr_angle
     """
-    def _speeds(arr_norm, idx):
-        v = np.linalg.norm(np.diff(arr_norm[:, idx, :], axis=0), axis=1)
-        return v
+    import scipy.stats as _ss
+    from kinescope._vendor import circstat as _CS
 
-    def _pearson_or_zero(a, b):
-        if len(a) < 3 or np.std(a) < 1e-8 or np.std(b) < 1e-8:
+    def _iqr(x):
+        return float(np.nanpercentile(x, 75) - np.nanpercentile(x, 25))
+
+    def _shannon(x, decimals):
+        x = np.round(x[np.isfinite(x)], decimals)
+        if len(x) == 0:
             return 0.0
-        return float(pearsonr(a, b).statistic)
+        vals, counts = np.unique(x, return_counts=True)
+        p = counts / counts.sum()
+        return float(_ss.entropy(p))
+
+    def _vel(pos):
+        """Frame-to-frame velocity from position series (T,)."""
+        return np.concatenate(([0.0], np.diff(pos)))
+
+    def _acc(vel):
+        return np.concatenate(([0.0], np.diff(vel)))
+
+    def _xy_feats(x, y):
+        """11 XY features for a single limb trajectory."""
+        vx = _vel(x);  vy = _vel(y)
+        ax = _acc(vx); ay = _acc(vy)
+        return [
+            float(np.nanmedian(x)),           # medianx
+            float(np.nanmedian(y)),           # mediany
+            _iqr(x),                          # IQRx
+            _iqr(y),                          # IQRy
+            float(np.nanmedian(np.abs(vx))),  # medianvelx
+            float(np.nanmedian(np.abs(vy))),  # medianvely
+            _iqr(vx),                         # IQRvelx
+            _iqr(vy),                         # IQRvely
+            _iqr(ax),                         # IQRaccx
+            _iqr(ay),                         # IQRaccy
+            (_shannon(x, 2) + _shannon(y, 2)) / 2,  # meanent
+        ]
+
+    def _angle_feats(angles):
+        """6 angle features for a single joint angle series (degrees)."""
+        rad = np.radians(angles[np.isfinite(angles)])
+        mean_a = float(np.degrees(_CS.nanmean(rad)))
+        std_a  = float(np.sqrt(np.degrees(_CS.nanvar(rad)))) if len(rad) > 1 else 0.0
+        vel_a  = np.concatenate(([0.0], np.diff(angles)))
+        acc_a  = np.concatenate(([0.0], np.diff(vel_a)))
+        return [
+            mean_a,
+            std_a,
+            _shannon(angles, 0),             # entropy_angle (rounded to degree)
+            float(np.nanmedian(np.abs(vel_a))),  # median_vel_angle
+            _iqr(vel_a),                     # IQR_vel_angle
+            _iqr(acc_a),                     # IQR_acc_angle
+        ]
+
+    def _joint_angle(arr, v_idx, p_idx, d_idx, is_elbow_knee=True):
+        """Compute joint angle (degrees) for all T frames. (T,)"""
+        v  = arr[:, v_idx, :]
+        p  = arr[:, p_idx, :]
+        d  = arr[:, d_idx, :]
+        vp = p - v;  vd = d - v
+        dot = (vp * vd).sum(axis=-1)
+        det = vp[:, 0] * vd[:, 1] - vp[:, 1] * vd[:, 0]
+        ang = np.degrees(np.arctan2(det, dot))
+        if is_elbow_knee:
+            ang = np.abs(ang)
+        return ang
+
+    def _lr_corr(a, b):
+        mask = np.isfinite(a) & np.isfinite(b)
+        if mask.sum() < 3 or np.std(a[mask]) < 1e-8 or np.std(b[mask]) < 1e-8:
+            return 0.0
+        return float(pearsonr(a[mask], b[mask]).statistic)
+
+    # COCO-17 indices
+    # neck computed as mean of left_shoulder(5) and right_shoulder(6)
+    L_SHOULDER, R_SHOULDER = 5, 6
+    L_ELBOW, R_ELBOW       = 7, 8
+    L_WRIST, R_WRIST       = 9, 10
+    L_HIP, R_HIP           = 11, 12
+    L_KNEE, R_KNEE         = 13, 14
+    L_ANKLE, R_ANKLE       = 15, 16
 
     rows = []
     for arr in arrays:
-        arr_norm = normalize_clip(np.nan_to_num(arr, nan=0.0))
+        a = normalize_clip(np.nan_to_num(arr, nan=0.0))  # (T, 17, 2)
 
-        lw = _speeds(arr_norm, 9)
-        rw = _speeds(arr_norm, 10)
-        la = _speeds(arr_norm, 15)
-        ra = _speeds(arr_norm, 16)
+        # Add neck as joint 17 (mean of shoulders)
+        neck = (a[:, L_SHOULDER, :] + a[:, R_SHOULDER, :]) / 2.0
+        a_ext = np.concatenate([a, neck[:, None, :]], axis=1)  # (T, 18, 2)
+        NECK_IDX = 17
 
-        feat = [
-            # mean speed
-            float(np.nanmean(lw)), float(np.nanmean(rw)),
-            float(np.nanmean(la)), float(np.nanmean(ra)),
-            # speed variance
-            float(np.nanvar(lw)), float(np.nanvar(rw)),
-            float(np.nanvar(la)), float(np.nanvar(ra)),
-            # bilateral asymmetry
-            abs(float(np.nanmean(lw)) - float(np.nanmean(rw))),
-            abs(float(np.nanmean(la)) - float(np.nanmean(ra))),
-            # bilateral symmetry correlation
-            _pearson_or_zero(lw, rw),
-            _pearson_or_zero(la, ra),
-            # upper-lower coordination
-            _pearson_or_zero(0.5 * (lw + rw), 0.5 * (la + ra)),
-            # smoothness (jerk proxy: mean |Δspeed|)
-            float(np.nanmean(np.abs(np.diff(lw)))) + float(np.nanmean(np.abs(np.diff(rw)))),
-            float(np.nanmean(np.abs(np.diff(la)))) + float(np.nanmean(np.abs(np.diff(ra)))),
-            # range of motion
-            float(np.nanstd(arr_norm[:, 9, 0]) + np.nanstd(arr_norm[:, 10, 0])),  # wrist-x
-            float(np.nanstd(arr_norm[:, 15, 1]) + np.nanstd(arr_norm[:, 16, 1])), # ankle-y
-        ]
+        # ── XY features (averaged L+R) ────────────────────────────────────────
+        def avg_xy_feats(l_idx, r_idx):
+            lf = _xy_feats(a[:, l_idx, 0], a[:, l_idx, 1])
+            rf = _xy_feats(a[:, r_idx, 0], a[:, r_idx, 1])
+            return [(lv + rv) / 2 for lv, rv in zip(lf, rf)]
+
+        wrist_xy = avg_xy_feats(L_WRIST, R_WRIST)
+        ankle_xy = avg_xy_feats(L_ANKLE, R_ANKLE)
+
+        # ── Angle features (averaged L+R) ─────────────────────────────────────
+        # right_elbow: vertex=R_ELBOW, proximal=R_SHOULDER, distal=R_WRIST
+        r_elbow_ang = _joint_angle(a, R_ELBOW, R_SHOULDER, R_WRIST)
+        l_elbow_ang = _joint_angle(a, L_ELBOW, L_SHOULDER, L_WRIST)
+        # right_knee: vertex=R_KNEE, proximal=R_HIP, distal=R_ANKLE
+        r_knee_ang  = _joint_angle(a, R_KNEE, R_HIP, R_ANKLE)
+        l_knee_ang  = _joint_angle(a, L_KNEE, L_HIP, L_ANKLE)
+
+        def avg_angle_feats(l_ang, r_ang):
+            lf = _angle_feats(l_ang)
+            rf = _angle_feats(r_ang)
+            return [(lv + rv) / 2 for lv, rv in zip(lf, rf)]
+
+        elbow_ang = avg_angle_feats(l_elbow_ang, r_elbow_ang)
+        knee_ang  = avg_angle_feats(l_knee_ang,  r_knee_ang)
+
+        # ── L/R correlations ──────────────────────────────────────────────────
+        wrist_lr_corr = _lr_corr(a[:, L_WRIST, 0], a[:, R_WRIST, 0])
+        ankle_lr_corr = _lr_corr(a[:, L_ANKLE, 0], a[:, R_ANKLE, 0])
+        elbow_lr_corr = _lr_corr(l_elbow_ang, r_elbow_ang)
+        knee_lr_corr  = _lr_corr(l_knee_ang,  r_knee_ang)
+
+        feat = (
+            wrist_xy + ankle_xy          # 22
+            + elbow_ang + knee_ang       # 12
+            + [wrist_lr_corr, ankle_lr_corr, elbow_lr_corr, knee_lr_corr]  # 4
+        )
         rows.append(np.array(feat, dtype=np.float32))
 
-    return np.array(rows, dtype=np.float32)  # (N, 17)
+    return np.array(rows, dtype=np.float32)  # (N, 38)
 
 
 # ── Normalization audit ───────────────────────────────────────────────────────
@@ -563,7 +661,7 @@ def run_linear_probe(
 
     # ── 2. Kinematic feature baseline ─────────────────────────────────────────
     print("\n=== Kinematic Feature Baseline ===")
-    print("Computing 17 handcrafted kinematic features (speed/asymmetry/coordination/jerk/ROM)...")
+    print("Computing 38 handcrafted kinematic features (GigaScience 2025 paper feature set)...")
     X_kin = _compute_kinematic_features(arrays)           # (N, 17)
     X_kin = StandardScaler().fit_transform(X_kin)         # z-score features
     kin_results = _run_loso(X_kin, scores_raw, tasks, subject_ids, ridge_alpha,
@@ -631,6 +729,30 @@ def run_linear_probe(
     }
     with open(out_dir / "loso_metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
+
+    # Save raw predictions for ROC curve plotting
+    preds = {
+        "kinematic": {
+            "y_true":  kin_results["all_y_true"],
+            "y_pred":  kin_results["all_y_pred"],
+            "y_raw":   kin_results["all_y_raw_test"],
+            "tasks":   kin_results["all_tasks_test"],
+        },
+        "encoder_combined": {
+            "y_true":  enc_results["all_y_true"],
+            "y_pred":  enc_results["all_y_pred"],
+            "y_raw":   enc_results["all_y_raw_test"],
+            "tasks":   enc_results["all_tasks_test"],
+        },
+        **{f"encoder_{t}": {
+            "y_true":  r["all_y_true"],
+            "y_pred":  r["all_y_pred"],
+            "y_raw":   r["all_y_raw_test"],
+            "tasks":   r["all_tasks_test"],
+        } for t, r in per_task_results.items()},
+    }
+    with open(out_dir / "predictions.json", "w") as f:
+        json.dump(preds, f)
 
     print(f"\nResults saved to {out_dir}/")
     print(f"  loso_metrics.json  scatter_combined.png  probe_comparison.png")
