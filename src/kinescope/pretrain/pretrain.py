@@ -28,7 +28,7 @@ from typing import Optional
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader
 
 from kinescope.prediction._vit import PoseJEPA, _sample_block_mask
 from kinescope.pretrain.clip_dataset import ClipDataset
@@ -114,6 +114,10 @@ def pretrain(
     invariant_weight: float = 0.0,
     long_horizon_weight: float = 0.0,
     long_horizon_segments: int = 4,
+    ema_warmup_epochs: Optional[int] = None,
+    sigreg_weight: float = 0.0,
+    resume: Optional[str] = None,
+    grad_clip: float = 5.0,
 ) -> dict:
     """
     Run Pose-JEPA pretraining.
@@ -165,6 +169,8 @@ def pretrain(
         if npy_files:
             clips = np.concatenate([np.load(f, mmap_mode="r") for f in npy_files], axis=0)
             print(f"Loaded {len(clips)} clips from {len(npy_files)} .npy files")
+            # Pre-sanitize in-place: eliminates per-item nan_to_num + copy overhead in __getitem__
+            clips = np.nan_to_num(np.asarray(clips, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
         else:
             print(f"Loading COCO-17 CSV files from {data_dir} ...")
             clips = _load_coco_clips(data_dir, seq_len=seq_len)
@@ -182,14 +188,33 @@ def pretrain(
         clips = np.asarray(clips[idx], dtype=np.float32)
         print(f"Subsampled to {len(clips)} clips (--max-clips)")
 
-    # Motion-aware sampling
-    motion_weights = ClipDataset.compute_motion_weights(clips)
+    # Motion-aware sampling — cache weights to avoid recomputing on 1.44M clips.
+    # Use num_workers=0: for this small model, CUDA async execution overlaps data
+    # loading with GPU compute, and IPC overhead from workers exceeds the benefit.
+    # Use numpy for index generation (torch.multinomial is prohibitively slow at 1.44M).
+    weights_cache = output_dir / "motion_weights.npy"
+    if weights_cache.exists():
+        print("Loading cached motion weights ...")
+        motion_weights = np.load(weights_cache)
+    else:
+        print(f"Computing motion weights for {len(clips)} clips ...")
+        motion_weights = ClipDataset.compute_motion_weights(clips)
+        np.save(weights_cache, motion_weights)
+        print(f"Motion weights cached to {weights_cache}")
+
+    p = motion_weights / motion_weights.sum()
+    sample_idx = np.random.choice(len(clips), size=len(clips), replace=True, p=p)
+
+    from torch.utils.data import Sampler
+    class _NumpySampler(Sampler):
+        def __init__(self, idx): self.idx = idx
+        def __iter__(self): return iter(self.idx.tolist())
+        def __len__(self): return len(self.idx)
+
     dataset = ClipDataset(clips, motion_weights)
-    sampler = WeightedRandomSampler(
-        torch.tensor(motion_weights), num_samples=len(dataset), replacement=True
-    )
     loader = DataLoader(
-        dataset, batch_size=batch_size, sampler=sampler, num_workers=0, pin_memory=(dev.type == "cuda")
+        dataset, batch_size=batch_size, sampler=_NumpySampler(sample_idx),
+        num_workers=4, pin_memory=(dev.type == "cuda"), persistent_workers=True,
     )
 
     # Build Pose-JEPA model
@@ -204,6 +229,7 @@ def pretrain(
         invariant_weight=invariant_weight,
         long_horizon_weight=long_horizon_weight,
         long_horizon_segments=long_horizon_segments,
+        sigreg_weight=sigreg_weight,
     ).to(dev)
 
     trainable = [p for p in model.parameters() if p.requires_grad]
@@ -212,6 +238,38 @@ def pretrain(
     # while the EMA target encoder is still drifting. V-JEPA uses a cosine LR schedule
     # with a non-zero floor (Bardes et al., ICLR 2024, Appendix A).
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=lr * 0.05)
+
+    # Resume from checkpoint if requested
+    start_epoch = 1
+    jepa_losses = []
+    tpc_losses = []
+    invariant_losses = []
+    long_horizon_losses = []
+    sigreg_losses = []
+    total_losses = []
+    best_loss = float("inf")
+
+    if resume:
+        ckpt = torch.load(resume, map_location=dev, weights_only=False)
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        start_epoch = ckpt["epoch"] + 1
+        # Fast-forward scheduler to match resumed epoch
+        for _ in range(ckpt["epoch"]):
+            scheduler.step()
+        # Load existing metrics to continue appending
+        metrics_path = output_dir / "metrics.json"
+        if metrics_path.exists():
+            with open(metrics_path) as f:
+                prior = json.load(f)
+            jepa_losses = prior.get("jepa_losses", [])
+            tpc_losses = prior.get("tpc_losses", [])
+            invariant_losses = prior.get("invariant_losses", [])
+            long_horizon_losses = prior.get("long_horizon_losses", [])
+            sigreg_losses = prior.get("sigreg_losses", [])
+            total_losses = prior.get("total_losses", [])
+            best_loss = prior.get("best_loss", float("inf"))
+        print(f"Resumed from {resume} — starting at epoch {start_epoch}, best_loss={best_loss:.4f}")
 
     # Visualize input data before training
     if artifacts_dir:
@@ -236,18 +294,12 @@ def pretrain(
         )
         print(f"Input visualizations saved to {artifacts_dir}/")
 
-    jepa_losses = []
-    tpc_losses = []
-    invariant_losses = []
-    long_horizon_losses = []
-    total_losses = []
-    best_loss = float("inf")
-
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start_epoch, epochs + 1):
         model.train()
-        epoch_jepa, epoch_tpc, epoch_inv, epoch_lh, epoch_total, epoch_grads = [], [], [], [], [], []
+        epoch_jepa, epoch_tpc, epoch_inv, epoch_lh, epoch_sig, epoch_total, epoch_grads = [], [], [], [], [], [], []
         t0 = time.time()
 
+        skipped_steps = 0
         for batch in loader:
             batch = batch.to(dev)
 
@@ -255,46 +307,78 @@ def pretrain(
             with torch.cuda.amp.autocast(enabled=amp_enabled):
                 out = model(batch)
 
-            scaler.scale(out["total_loss"]).backward()
+            loss = out["total_loss"]
+
+            # Warn loudly if loss is non-finite before backward
+            if not torch.isfinite(loss):
+                print(f"  WARNING: non-finite loss ({loss.item():.4f}) at epoch {epoch} — skipping step")
+                skipped_steps += 1
+                continue
+
+            scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0).item()
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip).item()
+
+            # Detect non-finite gradients explicitly
+            if not np.isfinite(grad_norm):
+                print(f"  WARNING: non-finite grad_norm at epoch {epoch} — AMP will skip step")
+
+            scale_before = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
-            model.update_ema()
+
+            # Only update EMA when optimizer step was actually taken
+            if scaler.get_scale() == scale_before:
+                model.update_ema()
+            else:
+                skipped_steps += 1
 
             epoch_jepa.append(out["jepa_loss"].item())
             epoch_tpc.append(out["tpc_loss"].item())
             epoch_inv.append(out["invariant_loss"].item())
             epoch_lh.append(out["long_horizon_loss"].item())
+            epoch_sig.append(out["sigreg_loss"].item())
             epoch_total.append(out["total_loss"].item())
             epoch_grads.append(grad_norm)
 
+        if skipped_steps > 0:
+            print(f"  WARNING: {skipped_steps} steps skipped this epoch (inf/nan gradients)")
+
         scheduler.step()
-        model.step_ema_decay(epoch, epochs)
+        model.step_ema_decay(epoch, epochs, warmup_epochs=ema_warmup_epochs)
 
         mean_jepa = float(np.mean(epoch_jepa))
         mean_tpc = float(np.mean(epoch_tpc))
         mean_inv = float(np.mean(epoch_inv))
         mean_lh = float(np.mean(epoch_lh))
+        mean_sig = float(np.mean(epoch_sig))
         mean_total = float(np.mean(epoch_total))
-        mean_grad = float(np.mean(epoch_grads))
+        finite_grads = [g for g in epoch_grads if np.isfinite(g)]
+        mean_grad = float(np.mean(finite_grads)) if finite_grads else float("nan")
         current_lr = scheduler.get_last_lr()[0]
         jepa_losses.append(mean_jepa)
         tpc_losses.append(mean_tpc)
         invariant_losses.append(mean_inv)
         long_horizon_losses.append(mean_lh)
+        sigreg_losses.append(mean_sig)
         total_losses.append(mean_total)
 
         tpc_active = out["tpc_active_fraction"].item()
+        sig_str = f" | SIGReg={mean_sig:.4f}" if sigreg_weight > 0 else ""
         print(
             f"Epoch {epoch:4d}/{epochs} | JEPA={mean_jepa:.4f} | TPC={mean_tpc:.4f}"
-            f" | TPC_active={tpc_active:.2f} | grad={mean_grad:.3f} | lr={current_lr:.2e}"
+            f" | TPC_active={tpc_active:.2f}{sig_str} | grad={mean_grad:.3f} | lr={current_lr:.2e}"
             f" | ema_τ={model.current_ema_decay:.4f} | t={time.time() - t0:.1f}s"
         )
 
         if epoch % checkpoint_every == 0:
             torch.save(
-                {"epoch": epoch, "context_encoder": model.context_encoder.state_dict()},
+                {
+                    "epoch": epoch,
+                    "context_encoder":  model.context_encoder.state_dict(),
+                    "target_encoder":   model.target_encoder.state_dict(),
+                    "predictor":        model.predictor.state_dict(),
+                },
                 output_dir / f"checkpoint_ep{epoch:04d}.pt",
             )
             print(f"  → Checkpoint saved: checkpoint_ep{epoch:04d}.pt")
@@ -319,6 +403,8 @@ def pretrain(
                         "invariant_weight": invariant_weight,
                         "long_horizon_weight": long_horizon_weight,
                         "long_horizon_segments": long_horizon_segments,
+                        "ema_warmup_epochs": ema_warmup_epochs,
+                        "sigreg_weight": sigreg_weight,
                     },
                 },
                 output_dir / "best.pt",
@@ -340,6 +426,7 @@ def pretrain(
         "tpc_losses": tpc_losses,
         "invariant_losses": invariant_losses,
         "long_horizon_losses": long_horizon_losses,
+        "sigreg_losses": sigreg_losses,
         "total_losses": total_losses,
         "best_loss": best_loss,
     }

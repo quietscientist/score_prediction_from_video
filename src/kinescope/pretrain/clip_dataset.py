@@ -35,11 +35,7 @@ class ClipDataset(Dataset):
         return len(self.clips)
 
     def __getitem__(self, idx):
-        # Defensive sanitization: cached arrays from mixed datasets can contain
-        # NaN/Inf outliers that would otherwise poison the JEPA loss.
-        clip = np.array(self.clips[idx], dtype=np.float32, copy=True)
-        clip = np.nan_to_num(clip, nan=0.0, posinf=0.0, neginf=0.0)
-        return torch.tensor(clip, dtype=torch.float32)
+        return torch.tensor(self.clips[idx], dtype=torch.float32)
 
     @staticmethod
     def compute_motion_weights(
