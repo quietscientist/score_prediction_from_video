@@ -423,6 +423,7 @@ class PoseJEPA(nn.Module):
         long_horizon_weight: float = 0.0,
         long_horizon_segments: int = 4,
         ema_start: float = 0.9,
+        sigreg_weight: float = 0.0,
     ):
         super().__init__()
         self.seq_len = seq_len
@@ -436,6 +437,7 @@ class PoseJEPA(nn.Module):
         self.coord_dim = coord_dim
         self.ema_decay = ema_decay
         self.motion_threshold = motion_threshold
+        self.sigreg_weight = sigreg_weight
 
         self.context_encoder = PoseViT(
             embed_dim, n_layers, n_heads, seq_len, n_joints, coord_dim
@@ -463,20 +465,32 @@ class PoseJEPA(nn.Module):
             nn.Linear(embed_dim, embed_dim),
         )
 
-    def step_ema_decay(self, epoch: int, total_epochs: int) -> None:
+    def step_ema_decay(
+        self, epoch: int, total_epochs: int, warmup_epochs: Optional[int] = None
+    ) -> None:
         """
-        Cosine warmup for EMA decay: ema_start → ema_decay over training.
+        Cosine warmup for EMA decay: ema_start → ema_decay over warmup_epochs.
 
         Call once per epoch after the LR scheduler step.
         Early in training τ is low (target tracks context quickly → stable gradients).
         Late in training τ → ema_decay (target is stable → richer representation).
+
+        Parameters
+        ----------
+        epoch : int — current epoch (1-based)
+        total_epochs : int — total training epochs (used as warmup_epochs if not set)
+        warmup_epochs : int or None — epochs over which to ramp τ from ema_start to
+            ema_decay. If larger than total_epochs, τ never fully reaches ema_decay,
+            keeping the target encoder responsive throughout training. Defaults to
+            total_epochs (original behaviour).
 
         This schedule prevents the "drift collapse" failure mode where a fixed high τ
         causes the target to move faster than the context encoder can track as LR decays.
         Ref: MoCo v3 (Chen & He, ICCV 2021) §4.1; BYOL (Grill et al., NeurIPS 2020) §3.
         Cosine schedule formula: τ_t = τ_end - (τ_end - τ_start)·(cos(πt/T)+1)/2
         """
-        progress = min(epoch / max(total_epochs, 1), 1.0)
+        ramp_over = warmup_epochs if warmup_epochs is not None else total_epochs
+        progress = min(epoch / max(ramp_over, 1), 1.0)
         self.current_ema_decay = (
             self.ema_decay
             - (self.ema_decay - self.ema_start) * (math.cos(math.pi * progress) + 1) / 2
@@ -509,22 +523,20 @@ class PoseJEPA(nn.Module):
 
     @staticmethod
     def _entropy_from_signal(sig: torch.Tensor, bins: int = 16) -> torch.Tensor:
-        """Compute per-sample discrete entropy over a quantized (B, T) signal."""
-        B = sig.shape[0]
-        out = []
-        for b in range(B):
-            s = sig[b]
-            smin = s.min()
-            smax = s.max()
-            if (smax - smin).abs() < 1e-6:
-                out.append(s.new_zeros(()))
-                continue
-            q = ((s - smin) / (smax - smin + 1e-6) * (bins - 1)).long().clamp(0, bins - 1)
-            counts = torch.bincount(q, minlength=bins).float()
-            probs = counts / counts.sum().clamp_min(1.0)
-            ent = -(probs * (probs + 1e-8).log()).sum()
-            out.append(ent)
-        return torch.stack(out, dim=0)
+        """Compute per-sample discrete entropy over a quantized (B, T) signal.
+        Fully vectorized — no Python loop, no GPU-CPU synchronization."""
+        B, T = sig.shape
+        smin = sig.min(dim=1, keepdim=True).values   # (B, 1)
+        smax = sig.max(dim=1, keepdim=True).values   # (B, 1)
+        flat = (smax - smin).abs().squeeze(1) < 1e-6 # (B,) mask for constant signals
+        scale = (smax - smin).clamp_min(1e-6)
+        q = ((sig - smin) / scale * (bins - 1)).long().clamp(0, bins - 1)  # (B, T)
+        # Vectorized histogram via one-hot scatter
+        counts = torch.zeros(B, bins, dtype=sig.dtype, device=sig.device)
+        counts.scatter_add_(1, q, torch.ones_like(sig))   # (B, bins)
+        probs = counts / counts.sum(dim=1, keepdim=True).clamp_min(1.0)
+        ent = -(probs * (probs + 1e-8).log()).sum(dim=1)  # (B,)
+        return ent.masked_fill(flat, 0.0)
 
     def _clip_invariant_targets(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -605,6 +617,46 @@ class PoseJEPA(nn.Module):
             seg = token_tensor[:, s:e].mean(dim=(1, 2))  # (B, E)
             segs.append(seg)
         return torch.stack(segs, dim=1)
+
+    @staticmethod
+    def _sigreg_loss(
+        z: torch.Tensor, n_proj: int = 64, n_freqs: int = 8
+    ) -> torch.Tensor:
+        """
+        SIGReg: Sketched Isotropic Gaussian Regularization (Balestriero et al., 2024).
+
+        Constrains the embedding distribution to N(0,I) by penalizing deviation of
+        projected 1-D marginals from Gaussian statistics via characteristic function
+        (Fourier) matching. This enforces isotropic geometry, which is provably optimal
+        for downstream linear probes.
+
+        Applied to the context encoder's CLS token (shape: B × embed_dim).
+
+        Parameters
+        ----------
+        z : (B, embed_dim) — batch of embeddings
+        n_proj : int — number of random projection directions
+        n_freqs : int — number of Fourier test frequencies
+
+        Reference: LeJEPA (Balestriero et al., arXiv 2024); le-wm (quietscientist/le-wm)
+        """
+        B, D = z.shape
+        w = F.normalize(torch.randn(D, n_proj, device=z.device), dim=0)  # (D, n_proj)
+        proj = z @ w  # (B, n_proj)
+
+        t = torch.linspace(-3.0, 3.0, n_freqs, device=z.device)  # (n_freqs,)
+        gauss_w = torch.exp(-0.5 * t ** 2)  # (n_freqs,) — integration weights
+
+        phi_cos = torch.cos(proj.unsqueeze(-1) * t)  # (B, n_proj, n_freqs)
+        phi_sin = torch.sin(proj.unsqueeze(-1) * t)
+
+        # E[cos(tx)] = exp(-t²/2) under N(0,1);  E[sin(tx)] = 0
+        expected_cos = gauss_w.unsqueeze(0)  # (1, n_freqs) — broadcast over n_proj
+        loss = (
+            ((phi_cos.mean(0) - expected_cos) ** 2) * gauss_w
+            + (phi_sin.mean(0) ** 2) * gauss_w
+        ).mean()
+        return loss
 
     def forward(self, x: torch.Tensor) -> dict:
         """
@@ -711,11 +763,16 @@ class PoseJEPA(nn.Module):
             pred_future = self.long_horizon_predictor(ctx_coarse)
             long_horizon_loss = F.mse_loss(pred_future, tgt_future.detach())
 
+        sigreg_loss = x.new_zeros(1).squeeze()
+        if self.sigreg_weight > 0:
+            sigreg_loss = self._sigreg_loss(ctx_cls)
+
         total_loss = (
             jepa_loss
             + self.tpc_weight * tpc_loss
             + self.invariant_weight * invariant_loss
             + self.long_horizon_weight * long_horizon_loss
+            + self.sigreg_weight * sigreg_loss
         )
 
         return {
@@ -723,6 +780,7 @@ class PoseJEPA(nn.Module):
             "tpc_loss": tpc_loss,
             "invariant_loss": invariant_loss,
             "long_horizon_loss": long_horizon_loss,
+            "sigreg_loss": sigreg_loss,
             "total_loss": total_loss,
             "tpc_active_fraction": tpc_active_fraction,
         }
