@@ -1,13 +1,16 @@
-# Kinescope: Pose-JEPA for Clinical Movement Analysis
+# Kinescope: Pose-JEPA for Score Prediction from Video
 
 ## Goals
 
-Predict clinical severity scores from human movement videos using self-supervised pretraining on large unlabeled pose datasets, then linear probing on small labeled clinical datasets. Two target tasks:
+Predict movement quality scores from video using self-supervised pretraining on large unlabeled keypoint datasets, then linear probing on small labeled scoring datasets. Keypoints-only input is intentional: privacy-preserving, edge-inference-friendly, and data-efficient for small labeled datasets.
 
-- **UDysRS**: dyskinesia severity in Parkinson's disease (adult, 775 clips, UPDRS-style ordinal scores per body segment)
+**Current validation tasks:**
 - **GMA**: fidgety movement quality in infants (907 clips, 3-class: F+ normal / F+/- sporadic / F- absent)
+- **UDysRS**: dyskinesia severity in Parkinson's disease (adult, 775 clips, UPDRS-style ordinal scores per body segment)
 
-The core hypothesis is that a model pretrained to predict masked pose tokens learns movement representations that generalize to clinical scoring — without requiring labeled data during pretraining.
+**Planned extension:** AQA-7 (action quality assessment: diving, gymnastics, weightlifting) to demonstrate generalization beyond clinical settings.
+
+The core hypothesis is that a model pretrained to predict masked pose tokens learns movement representations that generalize to any scoring task — without requiring labeled data during pretraining.
 
 ---
 
@@ -22,16 +25,16 @@ The core hypothesis is that a model pretrained to predict masked pose tokens lea
 - **EMA target encoder** (τ = 0.9 → 0.996, cosine warmup over training): produces stable prediction targets without collapse. Updated each optimizer step.
 - **Spatiotemporal block masking** (~50% ratio, limb joints 2× weighted): the context encoder sees unmasked tokens; the predictor reconstructs masked target encoder embeddings.
 
-**Auxiliary losses** (all optional, additive, zero-weighted by default):
+**Auxiliary losses** (all optional, additive):
 
-| Loss | Flag | Purpose |
-|---|---|---|
-| TPC | `--tpc-weight` | Motion-gated temporal prediction: predict second half of clip from first half. Gated to clips with sufficient motion. |
-| Invariant | `--invariant-weight` | Predict 7 kinematic invariants (symmetry, smoothness, coordination, entropy) from CLS. Provides clinically-grounded structure. |
-| SIGReg | `--sigreg-weight` | Sketched isotropic Gaussian regularization on CLS embeddings. Constrains representation geometry toward N(0,I). |
-| Long-horizon | `--long-horizon-weight` | Coarse segment-level future latent prediction. |
+| Loss | Flag | Status | Purpose |
+|---|---|---|---|
+| SIGReg | `--sigreg-weight` | **Active** (default 0.01) | Sketched isotropic Gaussian regularization on CLS embeddings. Constrains representation geometry toward N(0,I). Validated alongside JEPA in current training run. |
+| TPC | `--tpc-weight` | Unvalidated (default 0.0) | Motion-gated temporal prediction: predict second half of clip from first half. Not recommended without ablation. |
+| Invariant | `--invariant-weight` | Unvalidated (default 0.0) | Predict 7 kinematic invariants (symmetry, smoothness, coordination, entropy) from CLS. Clinically motivated but not yet ablated. |
+| Long-horizon | `--long-horizon-weight` | Unvalidated (default 0.0) | Coarse segment-level future latent prediction. Not recommended without ablation. |
 
-**Downstream evaluation**: frozen encoder → mean CLS over sliding windows → ridge regression (UDysRS) or logistic regression with class balancing (GMA).
+**Downstream evaluation**: frozen encoder → per-window CLS embeddings (MIL) → logistic regression with subject-level AUROC aggregation. Mean-pooling over entire recordings is not used — it discards temporal structure and reduces effective training signal.
 
 ---
 

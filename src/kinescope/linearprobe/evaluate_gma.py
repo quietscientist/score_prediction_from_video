@@ -100,15 +100,65 @@ def _encode_windows(arrays: list, subject_ids: list, y_binary: np.ndarray,
             np.array(g_list))
 
 
+def _smooth_recording(arr: np.ndarray, fps: float = 25.0,
+                       pos_window_s: float = 0.5,
+                       vel_window_s: float = 0.25) -> tuple:
+    """
+    Replicate the original GMA pipeline smoothing (Chambers et al. 2020 /
+    GigaScience 2025): linear-interpolate NaNs, then rolling median + rolling
+    mean on positions; velocity smoothing is handled downstream.
+
+    Parameters
+    ----------
+    arr : (T, 17, 2) float32 — raw (unsmoothed, unnormalized) pose array
+    fps : float — frames per second of the recording (default 25)
+    pos_window_s : float — position smooth window in seconds (default 0.5)
+    vel_window_s : float — velocity smooth window in seconds (default 0.25)
+
+    Returns
+    -------
+    smoothed_arr : (T, 17, 2) — positions smoothed, NaNs interpolated
+    vel_smooth_frames : int — frame count for downstream velocity smoothing
+    """
+    import pandas as _pd
+    T, J, D = arr.shape
+    w_pos = max(1, round(pos_window_s * fps))
+    out = arr.copy()
+    for j in range(J):
+        for d in range(D):
+            s = _pd.Series(out[:, j, d])
+            s = s.interpolate(method="linear", limit_direction="both")
+            s = s.rolling(window=w_pos, center=True, min_periods=1).median()
+            s = s.rolling(window=w_pos, center=True, min_periods=1).mean()
+            out[:, j, d] = s.values
+    vel_smooth_frames = max(1, round(vel_window_s * fps))
+    return out, vel_smooth_frames
+
+
 def _kinematic_windows(arrays: list, subject_ids: list, y_binary: np.ndarray,
-                       seq_len: int) -> tuple:
+                       seq_len: int, smooth: bool = True,
+                       fps: float = 25.0) -> tuple:
     """
     Expand each recording into per-window kinematic features (38-dim).
+
+    Parameters
+    ----------
+    smooth : bool
+        If True (default), apply the original GMA pipeline smoothing
+        (rolling median + mean on positions, rolling mean on velocity)
+        before windowing, matching the GigaScience 2025 feature computation.
+    fps : float
+        Recording frame rate, used to convert smoothing windows from seconds
+        to frames (default 25 fps for PANDA/CHOP GMA data).
     """
     X_list, y_list, g_list = [], [], []
+    vel_smooth_frames = 0
     for arr, sid, label in zip(arrays, subject_ids, y_binary):
+        if smooth:
+            arr, vel_smooth_frames = _smooth_recording(arr, fps=fps)
         windows = _windows_from_array(arr, seq_len)
-        feats = _compute_kinematic_features(windows)   # (W, 38)
+        feats = _compute_kinematic_features(windows,
+                                             vel_smooth_frames=vel_smooth_frames)
         X_list.append(feats)
         y_list.extend([label] * len(windows))
         g_list.extend([sid] * len(windows))
@@ -208,17 +258,20 @@ def _run_subject_kfold(
 
 # ── Plots ─────────────────────────────────────────────────────────────────────
 
-def _plot_roc(kin_res: dict, enc_res: dict, save_path):
+def _plot_roc(kin_res: dict, enc_res: dict, save_path, hyb_res: dict = None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from sklearn.metrics import roc_curve
 
     fig, ax = plt.subplots(figsize=(6, 6))
-    for res, color, label in [
+    entries = [
         (kin_res, "#8C8C8C", "Kinematic (38 features)"),
         (enc_res, "#4C72B0", "Encoder (frozen)"),
-    ]:
+    ]
+    if hyb_res:
+        entries.append((hyb_res, "#2ca02c", "Hybrid (kin + encoder)"))
+    for res, color, label in entries:
         yt = np.array(res["all_y_true"])
         ys = np.array(res["all_y_score"])
         if 0 < yt.sum() < len(yt):
@@ -271,6 +324,48 @@ def _plot_score_dist(y_binary: np.ndarray, scores_raw: np.ndarray, save_path):
     plt.close(fig)
 
 
+# ── Precomputed kinematic features loader ─────────────────────────────────────
+
+def _load_precomputed_kinematic(features_csv: str, subject_ids: list,
+                                 y_binary: np.ndarray) -> tuple:
+    """
+    Load whole-video kinematic features from the GigaScience 2025 precomputed
+    CSV (final_total_features.csv) and align to the loaded GMA subject list.
+
+    The CSV infant column is matched to subject_ids (string comparison after
+    converting both to str).  Subjects with no row in the CSV are dropped.
+
+    Returns
+    -------
+    X      : (N_matched, 38) float32
+    y      : (N_matched,) int32
+    groups : (N_matched,) str array — infant_id per row (one row = one subject)
+    """
+    import pandas as pd
+    df = pd.read_csv(features_csv)
+    feat_cols = [c for c in df.columns if c not in ("Unnamed: 0", "infant")]
+    df["infant_str"] = df["infant"].astype(str)
+
+    X_list, y_list, g_list = [], [], []
+    for sid, label in zip(subject_ids, y_binary):
+        row = df[df["infant_str"] == str(sid)]
+        if row.empty:
+            continue
+        X_list.append(row[feat_cols].values[0].astype(np.float32))
+        y_list.append(int(label))
+        g_list.append(sid)
+
+    n_dropped = len(subject_ids) - len(X_list)
+    if n_dropped:
+        print(f"  {n_dropped} subjects dropped (no matching row in {features_csv})")
+    print(f"  {len(X_list)} subjects with precomputed features  "
+          f"(normal={sum(1 for l in y_list if l==0)}  "
+          f"abnormal={sum(1 for l in y_list if l==1)})")
+    return (np.array(X_list, dtype=np.float32),
+            np.array(y_list, dtype=np.int32),
+            np.array(g_list))
+
+
 # ── Public API ─────────────────────────────────────────────────────────────────
 
 def run_gma_probe(
@@ -282,6 +377,7 @@ def run_gma_probe(
     C: float = 1.0,
     device: str = "auto",
     skip_kinematic: bool = False,
+    kinematic_features_csv: Optional[str] = None,
 ) -> dict:
     """
     Run the GMA linear probe evaluation (MIL setup).
@@ -300,6 +396,11 @@ def run_gma_probe(
         Logistic regression regularization (default 1.0).
     device : str
         'cuda', 'cpu', or 'auto'.
+    kinematic_features_csv : str, optional
+        Path to precomputed whole-video kinematic features CSV
+        (final_total_features.csv from GigaScience 2025).  When provided,
+        kinematic features are loaded directly instead of recomputed,
+        giving a paper-faithful baseline with correct smoothing.
 
     Returns
     -------
@@ -328,8 +429,16 @@ def run_gma_probe(
         print("\n=== Kinematic Feature Baseline: SKIPPED (--skip-kinematic) ===")
         kin_results = {"pooled_auroc": float("nan"), "all_y_true": [], "all_y_score": [],
                        "aggregate": {}, "fold_results": []}
+        X_kin = []
+    elif kinematic_features_csv:
+        print(f"\n=== Kinematic Feature Baseline (precomputed, GigaScience 2025) ===")
+        X_kin, y_kin, g_kin = _load_precomputed_kinematic(
+            kinematic_features_csv, subject_ids, y_binary)
+        kin_results = _run_subject_kfold(X_kin, y_kin, g_kin,
+                                         n_splits=n_splits, C=C,
+                                         label="kinematic_baseline")
     else:
-        print("\n=== Kinematic Feature Baseline (38 features, MIL) ===")
+        print("\n=== Kinematic Feature Baseline (38 features, MIL, recomputed) ===")
         X_kin, y_kin, g_kin = _kinematic_windows(arrays, subject_ids, y_binary, seq_len)
         print(f"  {len(X_kin)} windows from {len(arrays)} recordings  "
               f"(mean {len(X_kin)/len(arrays):.1f} windows/recording)")
@@ -346,11 +455,26 @@ def run_gma_probe(
                                      n_splits=n_splits, C=C,
                                      label="encoder")
 
+    # ── Hybrid probe (kinematic + encoder, per-window concatenation) ───────────
+    # Only possible when kinematics were recomputed per-window (not precomputed CSV).
+    hybrid_results = None
+    if not skip_kinematic and not kinematic_features_csv:
+        if len(X_kin) == len(X_enc):
+            print(f"\n=== Hybrid Probe (38 kin + {X_enc.shape[1]} enc = "
+                  f"{38 + X_enc.shape[1]}-dim, MIL) ===")
+            X_hyb = np.concatenate([X_kin, X_enc], axis=1)
+            hybrid_results = _run_subject_kfold(X_hyb, y_enc, g_enc,
+                                                n_splits=n_splits, C=C,
+                                                label="hybrid")
+        else:
+            print(f"\n[hybrid] Skipped: window count mismatch "
+                  f"(kin={len(X_kin)}, enc={len(X_enc)})")
+
     # ── Save outputs ───────────────────────────────────────────────────────────
     out_dir = pathlib.Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    _plot_roc(kin_results, enc_results, out_dir / "roc_curve.png")
+    _plot_roc(kin_results, enc_results, out_dir / "roc_curve.png", hyb_res=hybrid_results)
     _plot_score_dist(y_binary, scores_raw, out_dir / "score_distribution.png")
 
     metrics = {
@@ -358,13 +482,17 @@ def run_gma_probe(
                       if k in ("aggregate", "pooled_auroc", "fold_results")},
         "encoder":   {k: v for k, v in enc_results.items()
                       if k in ("aggregate", "pooled_auroc", "fold_results")},
+        "hybrid":    ({k: v for k, v in hybrid_results.items()
+                       if k in ("aggregate", "pooled_auroc", "fold_results")}
+                      if hybrid_results else None),
         "config": {
             "pretrained_weights": str(pretrained_weights),
             "n_splits":           n_splits,
             "C":                  C,
             "seq_len":            seq_len,
             "n_recordings":       N,
-            "n_windows_kin":      len(X_kin) if not skip_kinematic else None,
+            "n_windows_kin":      len(X_kin) if (not skip_kinematic and len(X_kin)) else None,
+            "kinematic_features_csv": str(kinematic_features_csv) if kinematic_features_csv else None,
             "n_windows_enc":      len(X_enc),
             "n_normal":           int((y_binary == 0).sum()),
             "n_abnormal":         int((y_binary == 1).sum()),
@@ -379,6 +507,9 @@ def run_gma_probe(
                       "y_score": kin_results["all_y_score"]},
         "encoder":   {"y_true": enc_results["all_y_true"],
                       "y_score": enc_results["all_y_score"]},
+        "hybrid":    ({"y_true": hybrid_results["all_y_true"],
+                       "y_score": hybrid_results["all_y_score"]}
+                      if hybrid_results else {"y_true": [], "y_score": []}),
     }
     with open(out_dir / "predictions.json", "w") as f:
         json.dump(preds, f)

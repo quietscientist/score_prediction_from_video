@@ -147,10 +147,18 @@ def _encode_clips(arrays: list, encoder, seq_len: int, device) -> np.ndarray:
 
 # ── Kinematic feature baseline ────────────────────────────────────────────────
 
-def _compute_kinematic_features(arrays: list) -> np.ndarray:
+def _compute_kinematic_features(arrays: list, vel_smooth_frames: int = 0) -> np.ndarray:
     """
     Compute 38 kinematic features matching the GigaScience 2025 paper feature set.
     normalize_clip is applied internally.  Returns (N, 38) float32.
+
+    Parameters
+    ----------
+    arrays : list of (T, 17, 2) arrays
+    vel_smooth_frames : int
+        If > 1, apply a centered rolling mean of this width to velocity (and
+        angle velocity) before computing IQR/median stats.  Set to
+        round(0.25 * fps) to match the original GMA pipeline's delta_window.
 
     Features (trunk-length-normalized coordinates):
       XY features for wrist (L+R averaged, 11 each = 22):
@@ -166,6 +174,7 @@ def _compute_kinematic_features(arrays: list) -> np.ndarray:
       L/R correlations (4):
         Wrist_lrCorr_x, Ankle_lrCorr_x, Elbow_lrCorr_angle, Knee_lrCorr_angle
     """
+    import pandas as _pd
     import scipy.stats as _ss
     from kinescope._vendor import circstat as _CS
 
@@ -187,9 +196,17 @@ def _compute_kinematic_features(arrays: list) -> np.ndarray:
     def _acc(vel):
         return np.concatenate(([0.0], np.diff(vel)))
 
+    def _smooth_vel(v):
+        """Optionally smooth velocity with a centered rolling mean."""
+        if vel_smooth_frames > 1:
+            return (_pd.Series(v)
+                    .rolling(vel_smooth_frames, center=True, min_periods=1)
+                    .mean().values)
+        return v
+
     def _xy_feats(x, y):
         """11 XY features for a single limb trajectory."""
-        vx = _vel(x);  vy = _vel(y)
+        vx = _smooth_vel(_vel(x));  vy = _smooth_vel(_vel(y))
         ax = _acc(vx); ay = _acc(vy)
         return [
             float(np.nanmedian(x)),           # medianx
@@ -210,7 +227,7 @@ def _compute_kinematic_features(arrays: list) -> np.ndarray:
         rad = np.radians(angles[np.isfinite(angles)])
         mean_a = float(np.degrees(_CS.nanmean(rad)))
         std_a  = float(np.sqrt(np.degrees(_CS.nanvar(rad)))) if len(rad) > 1 else 0.0
-        vel_a  = np.concatenate(([0.0], np.diff(angles)))
+        vel_a  = _smooth_vel(np.concatenate(([0.0], np.diff(angles))))
         acc_a  = np.concatenate(([0.0], np.diff(vel_a)))
         return [
             mean_a,

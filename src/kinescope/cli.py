@@ -69,6 +69,7 @@ def _cmd_gma_probe(args):
         C=args.C,
         device=args.device,
         skip_kinematic=args.skip_kinematic,
+        kinematic_features_csv=args.kinematic_features_csv,
     )
 
 
@@ -272,6 +273,11 @@ def main():
                        choices=["auto", "cpu", "cuda", "mps"])
     p_gma.add_argument("--skip-kinematic",     action="store_true", dest="skip_kinematic",
                        help="Skip kinematic baseline (faster; useful when only encoder result needed)")
+    p_gma.add_argument("--kinematic-features-csv", default=None, dest="kinematic_features_csv",
+                       help="Path to precomputed whole-video kinematic features CSV "
+                            "(final_total_features.csv from GigaScience 2025). "
+                            "When provided, features are loaded directly instead of recomputed, "
+                            "giving a paper-faithful baseline with correct smoothing.")
     p_gma.set_defaults(func=_cmd_gma_probe)
 
     parsed = parser.parse_args()
