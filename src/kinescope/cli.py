@@ -58,6 +58,20 @@ def _cmd_linearprobe(args):
     )
 
 
+def _cmd_gma_probe(args):
+    from kinescope.linearprobe.evaluate_gma import run_gma_probe
+    run_gma_probe(
+        data_dir=args.data_dir,
+        scores_file=args.scores_file,
+        pretrained_weights=args.pretrained_weights,
+        output_dir=args.output,
+        n_splits=args.n_splits,
+        C=args.C,
+        device=args.device,
+        skip_kinematic=args.skip_kinematic,
+    )
+
+
 def _cmd_cache_datasets(args):
     import pathlib
     import numpy as np
@@ -101,6 +115,10 @@ def _cmd_pretrain(args):
         invariant_weight=args.invariant_weight,
         long_horizon_weight=args.long_horizon_weight,
         long_horizon_segments=args.long_horizon_segments,
+        ema_warmup_epochs=args.ema_warmup_epochs,
+        sigreg_weight=args.sigreg_weight,
+        resume=args.resume,
+        grad_clip=args.grad_clip,
     )
 
 
@@ -201,6 +219,18 @@ def main():
                       help="Weight for coarse segment-level future latent prediction objective.")
     p_pt.add_argument("--long-horizon-segments", type=int, default=4, dest="long_horizon_segments",
                       help="Number of temporal segments per clip for long-horizon objective (default: 4).")
+    p_pt.add_argument("--sigreg-weight", type=float, default=0.0, dest="sigreg_weight",
+                      help="Weight for SIGReg auxiliary loss (LeJEPA isotropic Gaussian regularization). "
+                           "Constrains CLS embeddings toward N(0,I) geometry, improving linear probe quality.")
+    p_pt.add_argument("--resume", default=None, dest="resume",
+                      help="Path to latest.pt checkpoint to resume training from.")
+    p_pt.add_argument("--grad-clip", type=float, default=5.0, dest="grad_clip",
+                      help="Gradient clipping max norm (default: 5.0). "
+                           "Previous default was 1.0 which caused over-clipping of invariant loss terms.")
+    p_pt.add_argument("--ema-warmup-epochs", type=int, default=None, dest="ema_warmup_epochs",
+                      help="Epochs over which to ramp EMA τ from ema_start to ema_decay. "
+                           "Set larger than --epochs to keep τ low throughout training "
+                           "(e.g. 3× epochs). Defaults to --epochs (original behaviour).")
     p_pt.set_defaults(func=_cmd_pretrain)
 
     # ── probe (linearprobe) ───────────────────────────────────────────────────
@@ -222,6 +252,27 @@ def main():
                           choices=["auto", "cpu", "cuda", "mps"])
         p_lp.add_argument("--artifacts-dir",      default="artifacts",      dest="artifacts_dir")
         p_lp.set_defaults(func=_cmd_linearprobe)
+
+    # ── gma-probe ─────────────────────────────────────────────────────────────
+    p_gma = sub.add_parser("gma-probe",
+                            help="Stratified k-fold linear probe on GMA infant dataset")
+    p_gma.add_argument("--data-dir",           required=True, dest="data_dir",
+                       help="Directory containing JSON pose files ({infant}_{session}_{age_code}.json)")
+    p_gma.add_argument("--scores-file",        default=None, dest="scores_file",
+                       help="Path to gma_scores.csv (default: {data_dir}/gma_scores.csv)")
+    p_gma.add_argument("--pretrained-weights", default=None, dest="pretrained_weights",
+                       help="Path to pretrained ViT checkpoint (.pt). Omit for random-init baseline.")
+    p_gma.add_argument("--output",             default="results/gma_probe",
+                       help="Output directory for metrics and plots")
+    p_gma.add_argument("--n-splits",           type=int, default=5, dest="n_splits",
+                       help="StratifiedKFold splits (default: 5)")
+    p_gma.add_argument("--C",                  type=float, default=1.0,
+                       help="Logistic regression regularization C (default: 1.0)")
+    p_gma.add_argument("--device",             default="auto",
+                       choices=["auto", "cpu", "cuda", "mps"])
+    p_gma.add_argument("--skip-kinematic",     action="store_true", dest="skip_kinematic",
+                       help="Skip kinematic baseline (faster; useful when only encoder result needed)")
+    p_gma.set_defaults(func=_cmd_gma_probe)
 
     parsed = parser.parse_args()
     parsed.func(parsed)
