@@ -51,8 +51,43 @@ from kinescope.skeleton import COCO_PART_NAMES
 
 N_JOINTS = len(COCO_PART_NAMES)  # 17
 
-# SMPL-24 → COCO-17 mapping is handled by rekinect.joints.mapping.smpl24_to_coco17()
-# See /home/msegado/tapedeck/msegado/rekinect-pose/rekinect/joints/mapping.py
+# SMPL-24 → COCO-17 mapping (inlined from rekinect-pose/rekinect/joints/mapping.py)
+
+_SMPL24_TO_COCO17 = [
+    (16,  5),   # left_shoulder  → left_shoulder
+    (17,  6),   # right_shoulder → right_shoulder
+    (18,  7),   # left_elbow     → left_elbow
+    (19,  8),   # right_elbow    → right_elbow
+    (20,  9),   # left_wrist     → left_wrist
+    (21, 10),   # right_wrist    → right_wrist
+    ( 1, 11),   # left_hip       → left_hip
+    ( 2, 12),   # right_hip      → right_hip
+    ( 4, 13),   # left_knee      → left_knee
+    ( 5, 14),   # right_knee     → right_knee
+    ( 7, 15),   # left_ankle     → left_ankle
+    ( 8, 16),   # right_ankle    → right_ankle
+]
+
+# Offsets from SMPL head joint (index 15) to approximate face keypoints, metres.
+_HEAD_OFFSETS = {
+    0: ( 0.00,  0.03,  0.05),   # nose
+    1: ( 0.03,  0.02, -0.02),   # left_eye
+    2: (-0.03,  0.02, -0.02),   # right_eye
+    3: ( 0.06,  0.00,  0.00),   # left_ear
+    4: (-0.06,  0.00,  0.00),   # right_ear
+}
+
+
+def smpl24_to_coco17(xyz_smpl24: np.ndarray) -> np.ndarray:
+    """Convert (T, 24, 3) SMPL-24 joints to (T, 17, 3) COCO-17."""
+    T = xyz_smpl24.shape[0]
+    out = np.zeros((T, 17, 3), dtype=np.float64)
+    for smpl_idx, coco_idx in _SMPL24_TO_COCO17:
+        out[:, coco_idx] = xyz_smpl24[:, smpl_idx]
+    head = xyz_smpl24[:, 15]
+    for coco_idx, (dx, dy, dz) in _HEAD_OFFSETS.items():
+        out[:, coco_idx] = head + np.array([dx, dy, dz])
+    return out
 
 
 def _parse_gender(value) -> str:
@@ -223,12 +258,6 @@ def _smpl_joints_to_coco(joints: np.ndarray) -> np.ndarray:
 
     Returns (T, 17, 2) float32
     """
-    import sys as _sys
-    _rekinect = "/home/msegado/tapedeck/msegado/rekinect-pose"
-    if _rekinect not in _sys.path:
-        _sys.path.insert(0, _rekinect)
-    from rekinect.joints.mapping import smpl24_to_coco17
-
     coco_xyz = smpl24_to_coco17(joints.astype(np.float64))  # (T, 17, 3)
     # AMASS world frame: Z=up → image Y = -Z (down is positive in image)
     coco_2d = np.stack([coco_xyz[:, :, 0], -coco_xyz[:, :, 2]], axis=-1)  # (T, 17, 2)
